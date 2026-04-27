@@ -5,16 +5,21 @@ Pipeline:
   1. Converti il documento sorgente in Markdown intermedio (document_to_md).
   2. Chiama l'LLM (con few-shot) per decidere quante skill servono e restituire
      un descrittore JSON {"single": bool, "skills": [...]}.
-  3a. Se single=True  → genera un unico file .md dalla skill identificata.
-  3b. Se single=False → per ogni sub-skill genera un .md dedicato (con chunking
-      se il documento è grande), poi genera il main skill che li referenzia.
-  4. Salva tutto in <input_stem>-skills/ accanto al file sorgente.
+  3a. Se single=True  → genera SKILL.md nella output dir.
+  3b. Se single=False → genera references/<name>.md per ogni sub-skill,
+      poi genera SKILL.md (index) che li referenzia.
+  4. Output layout:
+       <output_dir>/
+           SKILL.md          ← main / only skill (always this exact name)
+           references/
+               <name>.md     ← one file per sub-skill (multi mode only)
 
-Formato di output obbligatorio per ogni skill:
+Formato di output obbligatorio per ogni skill (Roo Code compatible):
 
     ---
     name: skillname
     description: when to use it
+    agents: [main_agent, general_purpose]
     ---
 
     Skill body in Markdown.
@@ -47,8 +52,12 @@ DEFAULT_OVERLAP = 1200
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_OUTPUT_TOKENS = 4000
-DEFAULT_MAX_RETRIES = 3          # max retry attempts for transient LLM errors
-DEFAULT_RETRY_BACKOFF = 5.0      # base backoff seconds (doubled each attempt)
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF = 5.0
+
+# Fixed output filenames / folders
+MAIN_SKILL_FILENAME = "SKILL.md"
+REFERENCES_DIR = "references"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -84,24 +93,27 @@ def _safe_strip(value: object, label: str = "LLM response") -> str:
 # ---------------------------------------------------------------------------
 
 SKILL_FORMAT_RULES = """\
-SKILL OUTPUT FORMAT — mandatory for every skill file:
+SKILL OUTPUT FORMAT — mandatory for every skill file (Roo Code compatible):
 
 Every output file MUST start with a YAML frontmatter block:
 
 ---
 name: skillname_in_snake_case
 description: One sentence answering "when should an agent load this skill?".
+agents: [main_agent, general_purpose]
 ---
 
 Skill body in Markdown.
 
 Rules:
-- The frontmatter MUST be the very first content (no blank lines before ---).
+- The frontmatter MUST be the very first content — no blank lines before the opening ---.
 - `name`: lowercase snake_case, no spaces, no special chars except underscores.
-- `description`: one concise sentence.
-- After the closing --- leave exactly one blank line, then start the body.
-- Do NOT put the frontmatter syntax inside the Markdown body.
-- Do NOT wrap the output in a fenced code block.
+- `description`: one concise sentence (no quotes around the value).
+- `agents`: always include exactly `[main_agent, general_purpose]` unless instructed otherwise.
+- After the closing --- leave exactly ONE blank line, then start the Markdown body.
+- Do NOT put YAML syntax inside the Markdown body.
+- Do NOT wrap the entire output in a fenced code block.
+- The very first line of the file must be --- (the opening frontmatter delimiter).
 """
 
 # ---------------------------------------------------------------------------
@@ -209,9 +221,12 @@ Instructions:
    ## Constraints
 4. If this is not chunk 1, output ONLY new sections/content not already covered;
    do not repeat the frontmatter or sections already written.
-5. Begin with the YAML frontmatter ONLY on chunk 1:
+5. Begin with the YAML frontmatter ONLY on chunk 1 (include the agents field):
+   ---
    name: {skill_name}
    description: {skill_description}
+   agents: [main_agent, general_purpose]
+   ---
 6. If this chunk contains NO content relevant to the topic, reply with exactly:
    NO_RELEVANT_CONTENT
 
@@ -238,18 +253,19 @@ Partial outputs (in order):
 {partials}
 
 Rules:
-- Output a single skill file starting with the YAML frontmatter.
+- Output a single skill file starting with the YAML frontmatter (name, description, agents).
+- The very first line must be --- (opening frontmatter delimiter).
 - Deduplicate aggressively; keep the most complete/authoritative version.
 - Preserve ALL code blocks verbatim; never rewrite them.
 - Sections: ## Purpose / ## When to use / ## Core instructions / ## Examples / ## Constraints
 """
 
 # ---------------------------------------------------------------------------
-# Prompt: Phase C – generate main skill (multi-skill mode)
+# Prompt: Phase C – generate main SKILL.md (multi-skill mode)
 # ---------------------------------------------------------------------------
 
 MAIN_SKILL_PROMPT = """\
-Generate the MAIN (index) skill file for a document broken into sub-skills.
+Generate the MAIN (index) skill file SKILL.md for a document broken into sub-skills.
 
 {skill_format_rules}
 
@@ -257,19 +273,26 @@ Document      : {filename}
 Main skill    : {main_skill_name}
 Description   : {main_skill_description}
 
-Sub-skills already generated:
+Sub-skills already generated (saved under references/):
 {sub_skills_list}
 
 Instructions:
-1. Start with the YAML frontmatter (name: {main_skill_name}).
+1. Start with the YAML frontmatter:
+   ---
+   name: {main_skill_name}
+   description: {main_skill_description}
+   agents: [main_agent, general_purpose]
+   ---
 2. Write a concise overview of what the document covers (3-6 bullets).
 3. ## Sub-skills section — for each sub-skill:
    ### <name>
-   File: `<name>.md`
-   Load when: <one sentence>
-4. ## Quick reference — the most critical cross-cutting rules (bullet list).
-5. Do NOT duplicate content from sub-skills; reference, do not repeat.
-6. Keep it concise — this is a router, not a repeat of the sub-skills.
+   File: `references/<name>.md`
+   Load when: <one sentence describing the exact situation>
+   Call: `load_skill("references/<name>")`
+4. ## Quick reference — the most critical cross-cutting rules as a bullet list.
+5. Do NOT duplicate content already in sub-skills; reference, do not repeat.
+6. Keep SKILL.md concise — it is a router/index, not a repeat of the sub-skills.
+7. The very first line of the output must be --- (the opening frontmatter delimiter).
 
 Document excerpt (first 4000 chars):
 <excerpt>
@@ -323,7 +346,8 @@ def parse_args(argv: Sequence[str]) -> Config:
         default=None,
         help=(
             "Directory di output (default: <input_stem>-skills/ "
-            "nella stessa cartella del file sorgente)"
+            "nella stessa cartella del file sorgente). "
+            "Contiene sempre SKILL.md e, in modalità multi, references/<name>.md."
         ),
     )
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
@@ -546,11 +570,8 @@ def call_llm(
             elapsed = time.monotonic() - t0
             log.debug("  ← %.1fs  [%s]  status=%d", elapsed, label, resp.status_code)
 
-            # Transient server error → retry
             if resp.status_code >= 500:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-
-            # Hard client error → fail immediately
             if resp.status_code >= 400:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
@@ -561,7 +582,6 @@ def call_llm(
             except (KeyError, IndexError, TypeError) as exc:
                 raise RuntimeError(f"Risposta malformata: {json.dumps(data)[:600]}") from exc
 
-            # Guard: content must be a non-empty string
             if content is None:
                 raise RuntimeError("content è None nella risposta LLM")
             if not isinstance(content, str):
@@ -579,7 +599,7 @@ def call_llm(
                     usage.get("total_tokens", "?"),
                 )
 
-            return content  # ← always a non-empty str here
+            return content
 
         except RuntimeError as exc:
             last_exc = exc
@@ -593,7 +613,6 @@ def call_llm(
             )
             time.sleep(backoff)
 
-    # Should never reach here, but satisfy type checker
     raise last_exc  # type: ignore[misc]
 
 
@@ -728,7 +747,6 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
             log.warning("  Chunk %d/%d skipped (LLM error): %s", i, len(chunks), exc)
             raw = ""
 
-        # Skip sentinel and empty responses
         if raw and raw.strip().upper() != "NO_RELEVANT_CONTENT":
             partials.append(raw)
         else:
@@ -746,7 +764,6 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
         log.info("  Solo 1 partial valido per %s — nessun merge necessario.", descriptor.name)
         return partials[0]
 
-    # Merge
     log.info("  Merge %d parti per skill %s ...", len(partials), descriptor.name)
     numbered = "\n\n".join(
         f"--- PARTIAL {i + 1}/{len(partials)} ---\n{p}" for i, p in enumerate(partials)
@@ -774,22 +791,22 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
 
 
 # ---------------------------------------------------------------------------
-# Phase C – generate main skill
+# Phase C – generate main SKILL.md
 # ---------------------------------------------------------------------------
 
 def generate_main_skill(
     config: Config,
     document_md: str,
     descriptors: List[SubSkillDescriptor],
-) -> tuple[str, str]:
-    log.info("--- Fase C: Generazione skill principale ---")
+) -> str:
+    log.info("--- Fase C: Generazione SKILL.md principale ---")
     stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "main"
     main_desc = (
         f"Master index for {config.input_path.name}. "
         "Load to discover which sub-skill to use for a given task."
     )
     sub_list = "\n".join(
-        f"- name: {d.name}\n  file: {d.name}.md\n"
+        f"- name: {d.name}\n  file: references/{d.name}.md\n"
         f"  description: {d.description}\n  section_hint: {d.section_hint}"
         for d in descriptors
     )
@@ -813,17 +830,32 @@ def generate_main_skill(
         ),
         label="main",
     )
-    log.info("Skill principale pronta  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
-    return content, stem
+    log.info("SKILL.md pronto  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
+    return content
 
 
 # ---------------------------------------------------------------------------
-# Output
+# Output helpers
 # ---------------------------------------------------------------------------
 
-def save_skill(output_dir: Path, name: str, content: str) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{name}.md"
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def save_main_skill(output_dir: Path, content: str) -> Path:
+    """Save the main skill as SKILL.md directly inside output_dir."""
+    _ensure_dir(output_dir)
+    path = output_dir / MAIN_SKILL_FILENAME
+    path.write_text(content, encoding="utf-8")
+    log.info("  ✓ Salvato: %s", path)
+    return path
+
+
+def save_sub_skill(output_dir: Path, name: str, content: str) -> Path:
+    """Save a sub-skill as references/<name>.md inside output_dir."""
+    ref_dir = output_dir / REFERENCES_DIR
+    _ensure_dir(ref_dir)
+    path = ref_dir / f"{name}.md"
     path.write_text(content, encoding="utf-8")
     log.info("  ✓ Salvato: %s", path)
     return path
@@ -854,18 +886,20 @@ def generate_skills(config: Config) -> List[Path]:
     saved: List[Path] = []
 
     if plan.single:
+        # Single mode: generate and save directly as SKILL.md
         descriptor = plan.skills[0]
         content = generate_sub_skill(config, descriptor, document_md)
-        saved.append(save_skill(config.output_dir, descriptor.name, content))
+        saved.append(save_main_skill(config.output_dir, content))
     else:
+        # Multi mode: sub-skills go to references/, main index to SKILL.md
         for i, descriptor in enumerate(plan.skills, 1):
             log.info("[%d/%d] %s", i, len(plan.skills), descriptor.name)
             content = generate_sub_skill(config, descriptor, document_md)
-            saved.append(save_skill(config.output_dir, descriptor.name, content))
+            saved.append(save_sub_skill(config.output_dir, descriptor.name, content))
             if i < len(plan.skills):
                 time.sleep(0.2)
-        main_content, main_name = generate_main_skill(config, document_md, plan.skills)
-        saved.append(save_skill(config.output_dir, main_name, main_content))
+        main_content = generate_main_skill(config, document_md, plan.skills)
+        saved.append(save_main_skill(config.output_dir, main_content))
 
     log.info("=== Completato in %.1fs — %d file generati ===", time.monotonic() - t0, len(saved))
     return saved
@@ -881,9 +915,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         global log
         log = setup_logging(verbose=config.verbose)
         paths = generate_skills(config)
-        print(f"\n✓ {len(paths)} skill generate in: {config.output_dir}/")
+        print(f"\n✓ {len(paths)} file generati in: {config.output_dir}/")
         for p in paths:
-            print(f"  • {p.name}")
+            # Show path relative to output_dir for readability
+            try:
+                display = p.relative_to(config.output_dir)
+            except ValueError:
+                display = p
+            print(f"  • {display}")
         return 0
     except Exception as exc:
         logging.getLogger("skill_generator").error("Errore fatale: %s", exc, exc_info=True)
