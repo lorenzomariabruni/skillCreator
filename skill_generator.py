@@ -2,12 +2,15 @@
 """CLI per convertire PDF o DOCX in una famiglia di skill per agenti tramite endpoint OpenAI-compatible.
 
 Pipeline:
-  1. Estrai il testo dal documento sorgente.
-  2. Chiama l'LLM per identificare i sub-skill presenti nel documento.
-  3. Per ogni sub-skill individuato chiama l'LLM e genera un file .md dedicato.
-  4. Genera una skill principale che referenzia tutti i sub-skill.
+  1. Converti il documento sorgente in Markdown intermedio (document_to_md).
+  2. Chiama l'LLM (con few-shot) per decidere quante skill servono e restituire
+     un descrittore JSON {"single": bool, "skills": [...]}.
+  3a. Se single=True  → genera un unico file .md dalla skill identificata.
+  3b. Se single=False → per ogni sub-skill genera un .md dedicato (con chunking
+      se il documento è grande), poi genera il main skill che li referenzia.
+  4. Salva tutto in <input_stem>-skills/ accanto al file sorgente.
 
-Formato di output obbligatorio per ogni skill (principale e sub-skill):
+Formato di output obbligatorio per ogni skill:
 
     ---
     name: skillname
@@ -26,9 +29,9 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Optional, Sequence
 
 import requests
 from docx import Document
@@ -46,19 +49,14 @@ DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_OUTPUT_TOKENS = 4000
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------------------------
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
-    """Configura e restituisce il logger principale dell'applicazione."""
     level = logging.DEBUG if verbose else logging.INFO
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(level)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    handler.setFormatter(formatter)
+    handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", "%H:%M:%S"))
     logger = logging.getLogger("skill_generator")
     logger.setLevel(level)
     logger.handlers.clear()
@@ -70,163 +68,200 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 log: logging.Logger = logging.getLogger("skill_generator")
 
 # ---------------------------------------------------------------------------
-# Skill output format rules (injected into every prompt)
+# Skill output format (injected into every generation prompt)
 # ---------------------------------------------------------------------------
 
 SKILL_FORMAT_RULES = """\
-SKILL OUTPUT FORMAT (mandatory for every skill file you produce):
-Every skill Markdown file MUST begin with a YAML frontmatter block followed by the skill body.
-The exact format is:
+SKILL OUTPUT FORMAT — mandatory for every skill file:
+
+Every output file MUST start with a YAML frontmatter block:
 
 ---
 name: skillname_in_snake_case
-description: One sentence describing WHEN an agent should load this skill.
+description: One sentence answering "when should an agent load this skill?".
 ---
 
-Skill body here in Markdown.
+Skill body in Markdown.
 
 Rules:
-- The frontmatter MUST be the very first content in the file (no blank lines before ---).
-- `name` must be a lowercase snake_case identifier, no spaces, no special chars except underscores.
-- `description` must answer "when should I load this skill?" in one concise sentence.
-- After the closing --- leave exactly one blank line, then start the Markdown body.
-- Do NOT include the frontmatter block syntax inside the Markdown body.
-- Do NOT wrap the entire output in a fenced code block.
+- The frontmatter MUST be the very first content (no blank lines before ---).
+- `name`: lowercase snake_case, no spaces, no special chars except underscores.
+- `description`: one concise sentence.
+- After the closing --- leave exactly one blank line, then start the body.
+- Do NOT put the frontmatter syntax inside the Markdown body.
+- Do NOT wrap the output in a fenced code block.
 """
 
 # ---------------------------------------------------------------------------
-# Prompt constants
+# System prompt
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = f"""\
 You are a senior AI agent skill author.
-Your task is to transform source material extracted from PDF or DOCX files into HIGH-QUALITY reusable skill files that can be imported into coding agents such as Roo Code, Claude Code style agents, or similar systems.
+You transform technical documents into HIGH-QUALITY reusable skill files for coding agents
+(Roo Code, Claude Code, and similar).
 
 {SKILL_FORMAT_RULES}
 
-Core objective:
-- Produce self-contained skill documents in Markdown.
-- Preserve the source intent, procedures, rules, heuristics, glossary, and examples.
-- Reorganize the content for maximum usefulness to another AI agent.
-- Remove repetition, OCR noise, boilerplate page furniture, and irrelevant fragments.
-
-Critical preservation rules:
-- If the source contains code examples, commands, config blocks, schemas, prompts, regexes, JSON, YAML, XML, SQL, or pseudocode, preserve them EXACTLY — copy them verbatim from the input, never rewrite or invent them.
-- Do not rewrite code examples unless the source itself contains obvious OCR corruption; if corruption is suspected, explicitly mark the snippet as possibly corrupted instead of silently fixing it.
-- Preserve parameter names, flags, environment variables, identifiers, paths, URLs, and API shapes exactly as found.
-- Do not summarize code into prose when the code itself carries instructional value.
-
-Optimization rules:
+Core rules:
+- Preserve source intent, procedures, rules, heuristics, glossary, and examples.
+- Reorganise for maximum agent usefulness; remove repetition, OCR noise, boilerplate.
+- Copy ALL code examples, commands, configs, schemas, regexes, JSON, YAML, XML, SQL
+  VERBATIM from the source. Never rewrite or invent code.
+- Do not summarise code into prose when the code itself carries instructional value.
 - Prefer imperative instructions addressed to the agent.
-- Convert descriptive material into operational rules.
-- Make the skill specific, concrete, and execution-oriented.
-- Merge duplicates; keep the most authoritative formulation.
-- Preserve domain terminology.
-- Do not invent features, APIs, commands, or examples not supported by the source.
-
-Style rules:
-- Clear, dense, agent-oriented writing.
-- Minimal fluff.
-- High information density.
-- Markdown only (after the YAML frontmatter).
-- No prefatory commentary.
-- No closing commentary.
+- No prefatory or closing commentary.
+- Return Markdown only (after the frontmatter).
 """
 
-# --------------- Phase A: identify sub-skills ---------------
+# ---------------------------------------------------------------------------
+# Prompt: Phase A – identify skills (with few-shot examples)
+# ---------------------------------------------------------------------------
 
 IDENTIFY_SKILLS_PROMPT = """\
-You are analyzing a technical document to identify the distinct topics or areas that each deserve their own dedicated skill file.
+Analyse the technical document below and decide which skill files are needed.
 
-Source filename: {filename}
-Source type: {source_type}
+RETURN ONLY a JSON object — no markdown fences, no explanation, nothing else.
 
-Read the document text below and return a JSON array of sub-skill descriptors.
-Each descriptor is an object with:
-  - "name": snake_case identifier for the skill (e.g. "kafka_producer_setup")
-  - "description": one sentence — when should an agent load this skill?
-  - "section_hint": a short phrase that locates this topic in the document (e.g. "Section 3 – Kafka configuration")
+Schema:
+{{
+  "single": <true if ONE skill file is sufficient, false if multiple are needed>,
+  "skills": [
+    {{
+      "name": "<snake_case identifier>",
+      "description": "<one sentence: when should an agent load this skill?>",
+      "section_hint": "<short phrase locating this topic in the document>"
+    }}
+  ]
+}}
 
-Return ONLY a valid JSON array (no markdown fences, no extra keys).
-Aim for 2-8 sub-skills; merge closely related topics into one skill.
+Rules:
+- When `single` is true, `skills` contains exactly ONE entry for the whole document.
+- When `single` is false, `skills` contains 2–8 entries (merge closely related topics).
+- Never return more than 8 skills.
+- `name` must be lowercase snake_case.
 
-Document text:
+--- FEW-SHOT EXAMPLES ---
+
+Example 1 — simple, single-topic document:
+Input document title: "Redis Cache Patterns"
+Expected output:
+{{"single": true, "skills": [{{"name": "redis_cache_patterns", "description": "Load when implementing or troubleshooting Redis caching strategies.", "section_hint": "entire document"}}]}}
+
+Example 2 — multi-topic guide:
+Input document title: "Python Data Engineering Handbook"
+Expected output:
+{{"single": false, "skills": [{{"name": "pandas_dataframe_ops", "description": "Load when performing data manipulation with pandas DataFrames.", "section_hint": "Section 2 – Pandas"}}, {{"name": "kafka_python_producer", "description": "Load when setting up a Kafka producer in Python.", "section_hint": "Section 5 – Kafka integration"}}, {{"name": "spark_job_submission", "description": "Load when submitting or tuning a PySpark job.", "section_hint": "Section 7 – Spark"}}]}}
+
+Example 3 — broad reference manual:
+Input document title: "AWS Infrastructure Runbook"
+Expected output:
+{{"single": false, "skills": [{{"name": "aws_vpc_setup", "description": "Load when creating or modifying a VPC configuration.", "section_hint": "Chapter 1 – Networking"}}, {{"name": "aws_iam_policies", "description": "Load when writing or auditing IAM policies.", "section_hint": "Chapter 3 – IAM"}}, {{"name": "aws_rds_backup", "description": "Load when configuring RDS automated backups or restores.", "section_hint": "Chapter 6 – Databases"}}]}}
+
+--- END OF EXAMPLES ---
+
+Source filename : {filename}
+Source type     : {source_type}
+
+Document (Markdown):
 <document>
-{document_text}
+{document_md}
 </document>
 """
 
-# --------------- Phase B: generate one sub-skill ---------------
+# ---------------------------------------------------------------------------
+# Prompt: Phase B – generate one sub-skill from one chunk
+# ---------------------------------------------------------------------------
 
-SUB_SKILL_PROMPT = """\
-You are generating a dedicated skill file for ONE specific topic extracted from a larger document.
+SUB_SKILL_CHUNK_PROMPT = """\
+Generate (or continue) a dedicated skill file for the topic below, using ONLY the
+content in the document chunk provided.
 
 {skill_format_rules}
 
-Sub-skill to generate:
+Skill to generate:
   name        : {skill_name}
   description : {skill_description}
   topic hint  : {section_hint}
 
-Source filename: {filename}
-Source type: {source_type}
+Source: {filename}  (chunk {chunk_index}/{total_chunks})
 
 Instructions:
-1. Focus ONLY on the topic described above; ignore unrelated content in the document.
-2. Extract ALL code examples, commands, configs, schemas relevant to this topic and include them VERBATIM (copy-paste from the document, never rewrite).
-3. Structure the body with these sections:
+1. Focus ONLY on the topic above; skip unrelated content.
+2. Include ALL code examples, commands, configs relevant to this topic VERBATIM.
+3. Structure:
    ## Purpose
    ## When to use
    ## Core instructions
-   ## Examples
+   ## Examples      ← every relevant code block from the source, verbatim
    ## Constraints
-4. The Examples section must contain every relevant code block from the source, preserved exactly.
-5. Begin the file with the YAML frontmatter as specified in the format rules, using:
+4. If this is not chunk 1, output ONLY new sections/content not already covered;
+   do not repeat the frontmatter or sections already written.
+5. Begin with the YAML frontmatter ONLY on chunk 1:
    name: {skill_name}
    description: {skill_description}
 
-Document text:
-<document>
-{document_text}
-</document>
+Chunk:
+<chunk>
+{chunk_text}
+</chunk>
 """
 
-# --------------- Phase C: generate main skill ---------------
+# ---------------------------------------------------------------------------
+# Prompt: Phase B merge – merge chunk outputs into one skill
+# ---------------------------------------------------------------------------
 
-MAIN_SKILL_PROMPT = """\
-You are generating the MAIN skill file for a document that has been broken into sub-skills.
+SUB_SKILL_MERGE_PROMPT = """\
+Merge the partial skill outputs below into ONE complete, deduplicated skill file.
 
 {skill_format_rules}
 
-Document: {filename}
-Main skill name: {main_skill_name}
-Main skill description: {main_skill_description}
+Skill metadata:
+  name        : {skill_name}
+  description : {skill_description}
 
-Sub-skills already generated (each is a separate .md file agents can import):
+Partial outputs (in order):
+{partials}
+
+Rules:
+- Output a single skill file starting with the YAML frontmatter.
+- Deduplicate aggressively; keep the most complete/authoritative version.
+- Preserve ALL code blocks verbatim; never rewrite them.
+- Sections: ## Purpose / ## When to use / ## Core instructions / ## Examples / ## Constraints
+"""
+
+# ---------------------------------------------------------------------------
+# Prompt: Phase C – generate main skill (multi-skill mode)
+# ---------------------------------------------------------------------------
+
+MAIN_SKILL_PROMPT = """\
+Generate the MAIN (index) skill file for a document broken into sub-skills.
+
+{skill_format_rules}
+
+Document      : {filename}
+Main skill    : {main_skill_name}
+Description   : {main_skill_description}
+
+Sub-skills already generated:
 {sub_skills_list}
 
 Instructions:
-1. Begin with the YAML frontmatter:
-   name: {main_skill_name}
-   description: {main_skill_description}
-2. Write a concise overview of what the full document covers.
-3. Include a "## Sub-skills" section that lists every sub-skill with:
-   - The filename to import (e.g. `kafka_producer_setup.md`)
-   - One sentence on when to call it
-   Example format:
-   ### kafka_producer_setup
-   File: `kafka_producer_setup.md`
-   Load when: setting up a Kafka producer in Python.
-4. Include a "## Quick reference" section with the most critical cross-cutting rules from the document.
-5. Do NOT duplicate content already in the sub-skills; link/reference instead.
-6. Keep it concise — this is an index and router, not a repeat of the sub-skills.
+1. Start with the YAML frontmatter (name: {main_skill_name}).
+2. Write a concise overview of what the document covers (3-6 bullets).
+3. ## Sub-skills section — for each sub-skill:
+   ### <name>
+   File: `<name>.md`
+   Load when: <one sentence>
+4. ## Quick reference — the most critical cross-cutting rules (bullet list).
+5. Do NOT duplicate content from sub-skills; reference, do not repeat.
+6. Keep it concise — this is a router, not a repeat of the sub-skills.
 
-Document overview (first 4000 chars):
-<document_excerpt>
+Document excerpt (first 4000 chars):
+<excerpt>
 {document_excerpt}
-</document_excerpt>
+</excerpt>
 """
-
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -234,20 +269,24 @@ Document overview (first 4000 chars):
 
 @dataclass
 class SubSkillDescriptor:
-    """Descrittore di un sub-skill identificato dall'LLM."""
     name: str
     description: str
     section_hint: str
 
 
 @dataclass
+class IdentifyResult:
+    single: bool
+    skills: List[SubSkillDescriptor]
+
+
+@dataclass
 class Config:
-    """Contiene i parametri runtime necessari per contattare l'endpoint LLM e generare le skill."""
     base_url: str
     api_key: str
     model: str
     input_path: Path
-    output_dir: Path
+    output_dir: Path          # auto-derived if not overridden
     max_chars: int = DEFAULT_MAX_CHARS
     overlap: int = DEFAULT_OVERLAP
     temperature: float = DEFAULT_TEMPERATURE
@@ -261,41 +300,51 @@ class Config:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: Sequence[str]) -> Config:
-    """Parsa gli argomenti CLI e restituisce una configurazione validata."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Converte un PDF o DOCX in una famiglia di skill Markdown "
-            "usando un endpoint OpenAI-compatible."
-        )
+        description="Converte PDF/DOCX in skill Markdown via endpoint OpenAI-compatible."
     )
-    parser.add_argument("input_file", help="Percorso del file sorgente .pdf o .docx")
+    parser.add_argument("input_file", help="File sorgente .pdf o .docx")
     parser.add_argument(
         "-o", "--output-dir",
-        default="skills_output",
-        help="Directory di output dove salvare i file .md generati (default: skills_output/)",
+        default=None,
+        help=(
+            "Directory di output (default: <input_stem>-skills/ "
+            "nella stessa cartella del file sorgente)"
+        ),
     )
-    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"), help="Base URL OpenAI-compatible")
-    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"), help="API key del provider")
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"), help="Modello da usare")
-    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="Dimensione massima del testo inviato all'LLM per sub-skill")
-    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP, help="Overlap tra chunk (usato solo se il documento è enorme)")
+    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"))
+    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS,
+                        help="Max chars per chunk inviato all'LLM")
+    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP,
+                        help="Overlap in chars tra chunk consecutivi")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     parser.add_argument("-v", "--verbose", action="store_true", default=False)
 
     args = parser.parse_args(argv)
+
     if args.max_chars < 1000:
         raise ValueError("--max-chars deve essere almeno 1000")
     if not args.base_url or not args.api_key or not args.model:
-        raise ValueError("base-url, api-key e model sono obbligatori (o via env)")
+        raise ValueError("base-url, api-key e model sono obbligatori (o via env OPENAI_*)")
+
+    input_path = Path(args.input_file)
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        # Auto-derive: <input_stem>-skills/ next to the input file
+        stem = re.sub(r"[^a-z0-9_\-]", "_", input_path.stem.lower()).strip("_-") or "skill"
+        output_dir = input_path.parent / f"{stem}-skills"
 
     return Config(
         base_url=args.base_url.rstrip("/"),
         api_key=args.api_key,
         model=args.model,
-        input_path=Path(args.input_file),
-        output_dir=Path(args.output_dir),
+        input_path=input_path,
+        output_dir=output_dir,
         max_chars=args.max_chars,
         overlap=args.overlap,
         temperature=args.temperature,
@@ -306,324 +355,413 @@ def parse_args(argv: Sequence[str]) -> Config:
 
 
 # ---------------------------------------------------------------------------
-# File reading
+# File reading – raw extraction
 # ---------------------------------------------------------------------------
 
-def read_input_file(input_path: Path) -> str:
-    """Legge un file PDF o DOCX e ne estrae il testo grezzo."""
+def read_raw_text(input_path: Path) -> str:
+    """Estrae il testo grezzo da PDF o DOCX."""
     if not input_path.exists():
         raise FileNotFoundError(f"File non trovato: {input_path}")
 
     suffix = input_path.suffix.lower()
-    log.info("Lettura file: %s  (formato: %s)", input_path.name, suffix.lstrip(".").upper())
+    log.info("Lettura file: %s  (%s)", input_path.name, suffix.lstrip(".").upper())
 
     if suffix == ".pdf":
-        text = extract_text_from_pdf(input_path)
-    elif suffix == ".docx":
-        text = extract_text_from_docx(input_path)
-    else:
-        raise ValueError("Formato non supportato. Usa un file .pdf o .docx")
-
-    cleaned = normalize_text(text)
-    if not cleaned.strip():
-        raise ValueError("Nessun testo estraibile dal documento")
-
-    log.info("Testo estratto: %d caratteri", len(cleaned))
-    return cleaned
+        return _extract_pdf(input_path)
+    if suffix == ".docx":
+        return _extract_docx(input_path)
+    raise ValueError(f"Formato non supportato: {suffix}. Usa .pdf o .docx")
 
 
-def extract_text_from_pdf(input_path: Path) -> str:
-    reader = PdfReader(str(input_path))
-    total_pages = len(reader.pages)
-    log.info("PDF: %d pagine trovate", total_pages)
+def _extract_pdf(path: Path) -> str:
+    reader = PdfReader(str(path))
+    log.info("PDF: %d pagine", len(reader.pages))
     parts: List[str] = []
-    for index, page in enumerate(reader.pages, start=1):
-        log.debug("  Estrazione pagina %d/%d ...", index, total_pages)
-        page_text = page.extract_text(extraction_mode="layout") or page.extract_text() or ""
-        parts.append(f"\n\n[PAGE {index}]\n{page_text}")
-    log.info("Estrazione PDF completata")
+    for i, page in enumerate(reader.pages, 1):
+        text = page.extract_text(extraction_mode="layout") or page.extract_text() or ""
+        parts.append(f"\n\n## Page {i}\n\n{text}")
     return "".join(parts)
 
 
-def iter_block_items(parent):
-    if isinstance(parent, _Document):
-        parent_element = parent.element.body
-    elif isinstance(parent, _Cell):
-        parent_element = parent._tc
-    else:
-        raise ValueError("Tipo DOCX non supportato per l'iterazione dei blocchi")
-    for child in parent_element.iterchildren():
+def _iter_docx_blocks(parent):
+    root = parent.element.body if isinstance(parent, _Document) else parent._tc
+    for child in root.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, parent)
         elif isinstance(child, CT_Tbl):
             yield Table(child, parent)
 
 
-def extract_text_from_docx(input_path: Path) -> str:
-    log.info("Apertura documento DOCX ...")
-    document = Document(str(input_path))
+def _extract_docx(path: Path) -> str:
+    log.info("Apertura DOCX ...")
+    doc = Document(str(path))
     blocks: List[str] = []
-    n_paragraphs = 0
-    n_tables = 0
-    for block in iter_block_items(document):
+    for block in _iter_docx_blocks(doc):
         if isinstance(block, Paragraph):
-            text = block.text.strip()
-            if text:
-                blocks.append(text)
-                n_paragraphs += 1
+            t = block.text.strip()
+            if t:
+                # Preserve heading level as Markdown heading
+                style = (block.style.name or "").lower()
+                if style.startswith("heading"):
+                    try:
+                        level = int(style.split()[-1])
+                    except ValueError:
+                        level = 2
+                    hashes = "#" * max(1, min(level, 6))
+                    blocks.append(f"{hashes} {t}")
+                else:
+                    blocks.append(t)
         elif isinstance(block, Table):
-            for row in block.rows:
-                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                if row_text:
-                    blocks.append(f"[TABLE] {row_text}")
-            n_tables += 1
-    log.info("DOCX: %d paragrafi, %d tabelle estratti", n_paragraphs, n_tables)
-    return "\n".join(blocks)
+            # Render table as Markdown table
+            rows = block.rows
+            if not rows:
+                continue
+            md_rows: List[str] = []
+            for r_idx, row in enumerate(rows):
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                md_rows.append("| " + " | ".join(cells) + " |")
+                if r_idx == 0:
+                    md_rows.append("| " + " | ".join(["---"] * len(cells)) + " |")
+            blocks.append("\n".join(md_rows))
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
-# Text processing
+# Document → clean Markdown conversion
 # ---------------------------------------------------------------------------
 
-def normalize_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+def document_to_md(raw_text: str) -> str:
+    """
+    Converts raw extracted text into clean Markdown that an LLM can read well.
+    - Normalises whitespace.
+    - Removes OCR noise (repeated special chars, isolated single chars on lines).
+    - Ensures code-like lines (indented 4+ spaces or starting with common CLI tokens)
+      are wrapped in fenced code blocks.
+    """
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\u00a0", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    lines = text.split("\n")
+    result: List[str] = []
+    in_code = False
+
+    for line in lines:
+        stripped = line.rstrip()
+
+        # Detect code block entry: line indented >=4 spaces or starts with $ / > (shell)
+        is_code_line = (
+            re.match(r"^    \S", stripped)
+            or re.match(r"^\$\s", stripped)
+            or re.match(r"^>>> ", stripped)
+        )
+
+        if is_code_line and not in_code:
+            result.append("```")
+            in_code = True
+        elif not is_code_line and in_code:
+            result.append("```")
+            in_code = False
+
+        result.append(stripped)
+
+    if in_code:
+        result.append("```")
+
+    return "\n".join(result).strip()
 
 
-def truncate_for_llm(text: str, max_chars: int) -> str:
-    """Tronca il testo a max_chars preservando gli ultimi caratteri come overlap implicito."""
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
+    """Splits text into overlapping chunks, preferring paragraph boundaries."""
     if len(text) <= max_chars:
-        return text
-    log.warning("Testo troncato da %d a %d caratteri per rispettare --max-chars", len(text), max_chars)
-    return text[:max_chars]
+        return [text]
+
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            split = text.rfind("\n\n", start, end)
+            if split == -1 or split <= start + max_chars // 3:
+                split = text.rfind("\n", start, end)
+            if split != -1 and split > start:
+                end = split
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(0, end - overlap)
+
+    log.info("Chunking: %d chunk  (max_chars=%d, overlap=%d)", len(chunks), max_chars, overlap)
+    for i, c in enumerate(chunks, 1):
+        log.debug("  Chunk %d: %d chars", i, len(c))
+    return chunks
 
 
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
-def build_headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+def _headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
-def call_chat_completion(
+def call_llm(
     config: Config,
     messages: List[dict],
-    response_format: dict | None = None,
+    response_format: Optional[dict] = None,
     label: str = "LLM",
 ) -> str:
-    """Effettua una chiamata al endpoint chat completions compatibile OpenAI."""
-    payload = {
+    payload: dict = {
         "model": config.model,
         "messages": messages,
         "temperature": config.temperature,
         "max_tokens": config.max_output_tokens,
     }
-    if response_format is not None:
+    if response_format:
         payload["response_format"] = response_format
 
     url = f"{config.base_url}/chat/completions"
     log.debug("  → POST %s  [%s]", url, label)
+    t0 = time.monotonic()
+    resp = requests.post(url, headers=_headers(config.api_key), json=payload, timeout=config.timeout)
+    elapsed = time.monotonic() - t0
 
-    t_start = time.monotonic()
-    response = requests.post(
-        url,
-        headers=build_headers(config.api_key),
-        json=payload,
-        timeout=config.timeout,
-    )
-    elapsed = time.monotonic() - t_start
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
 
-    if response.status_code >= 400:
-        raise RuntimeError(f"Errore HTTP {response.status_code}: {response.text}")
-
-    data = response.json()
-    log.debug("  ← risposta ricevuta in %.1fs  [%s]", elapsed, label)
+    data = resp.json()
+    log.debug("  ← %.1fs  [%s]", elapsed, label)
 
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Risposta inattesa dal provider: {json.dumps(data)[:1200]}") from exc
+        raise RuntimeError(f"Risposta inattesa: {json.dumps(data)[:800]}") from exc
 
-    usage = data.get("usage")
-    if usage:
-        log.debug(
-            "  token: prompt=%s  completion=%s  total=%s",
-            usage.get("prompt_tokens", "?"),
-            usage.get("completion_tokens", "?"),
-            usage.get("total_tokens", "?"),
-        )
-
+    if usage := data.get("usage"):
+        log.debug("  tokens prompt=%s compl=%s total=%s",
+                  usage.get("prompt_tokens", "?"),
+                  usage.get("completion_tokens", "?"),
+                  usage.get("total_tokens", "?"))
     return content
 
 
 # ---------------------------------------------------------------------------
-# Phase A – identify sub-skills
+# Phase A – identify skills
 # ---------------------------------------------------------------------------
 
-def identify_sub_skills(config: Config, document_text: str) -> List[SubSkillDescriptor]:
-    """Chiama l'LLM per identificare i sub-skill presenti nel documento."""
-    log.info("--- Fase A: Identificazione sub-skill ---")
-    truncated = truncate_for_llm(document_text, config.max_chars)
+def identify_skills(config: Config, document_md: str) -> IdentifyResult:
+    """Asks the LLM to return a JSON plan: {single, skills[]}."""
+    log.info("--- Fase A: Identificazione skill ---")
+
+    # For the identification call we send up to max_chars of the document
+    # (the LLM only needs an overview to decide the structure)
+    excerpt = document_md[:config.max_chars]
 
     prompt = IDENTIFY_SKILLS_PROMPT.format(
         filename=config.input_path.name,
         source_type=config.input_path.suffix.lower().lstrip("."),
-        document_text=truncated,
+        document_md=excerpt,
     )
 
-    content = call_chat_completion(
+    raw = call_llm(
         config,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": "You are a precise JSON-only responder. Output valid JSON with no extra text."},
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
-        label="identify sub-skills",
+        label="identify",
     )
 
-    # The model may return a top-level object with a list inside
     try:
-        parsed = json.loads(content)
+        parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"JSON non valido nella fase di identificazione: {content[:1000]}") from exc
+        raise RuntimeError(f"JSON non valido nella fase A: {raw[:600]}") from exc
 
-    # Normalize: accept both a bare list and {"skills": [...]} or similar wrappers
+    # Normalise: accept bare list (legacy) or {single, skills} object
     if isinstance(parsed, list):
         raw_list = parsed
-    elif isinstance(parsed, dict):
-        # find first key whose value is a list
-        raw_list = next((v for v in parsed.values() if isinstance(v, list)), [])
+        single = len(parsed) == 1
     else:
-        raw_list = []
+        single = bool(parsed.get("single", False))
+        raw_list = parsed.get("skills") or []
+        if not raw_list:
+            # fallback: find first list value
+            raw_list = next((v for v in parsed.values() if isinstance(v, list)), [])
 
     descriptors: List[SubSkillDescriptor] = []
     for item in raw_list:
         name = re.sub(r"[^a-z0-9_]", "_", (item.get("name") or "skill").lower()).strip("_")
-        description = (item.get("description") or "").strip()
-        section_hint = (item.get("section_hint") or "").strip()
+        desc = (item.get("description") or "").strip()
+        hint = (item.get("section_hint") or "").strip()
         if name:
-            descriptors.append(SubSkillDescriptor(name=name, description=description, section_hint=section_hint))
+            descriptors.append(SubSkillDescriptor(name=name, description=desc, section_hint=hint))
 
     if not descriptors:
-        log.warning("Nessun sub-skill identificato; genero un unico sub-skill generico.")
-        stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower())
+        log.warning("Nessuna skill identificata; fallback a skill unica.")
+        stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "skill"
         descriptors.append(SubSkillDescriptor(
-            name=stem or "skill",
-            description=f"Use when working with content from {config.input_path.name}.",
+            name=stem,
+            description=f"Use when working with {config.input_path.name}.",
             section_hint="entire document",
         ))
+        single = True
 
-    log.info("Sub-skill identificati: %d", len(descriptors))
+    if len(descriptors) == 1:
+        single = True
+
+    log.info("Modalità: %s  |  skill identificate: %d",
+             "SINGOLA" if single else "MULTI", len(descriptors))
     for d in descriptors:
-        log.info("  • %s  — %s", d.name, d.section_hint)
+        log.info("  • %-35s  %s", d.name, d.section_hint)
 
-    return descriptors
+    return IdentifyResult(single=single, skills=descriptors)
 
 
 # ---------------------------------------------------------------------------
-# Phase B – generate each sub-skill
+# Phase B – generate one sub-skill (with chunking + merge)
 # ---------------------------------------------------------------------------
 
-def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_text: str) -> str:
-    """Genera il contenuto Markdown di un singolo sub-skill."""
-    log.info("  Generazione sub-skill: %s ...", descriptor.name)
-    truncated = truncate_for_llm(document_text, config.max_chars)
+def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_md: str) -> str:
+    """Generates the Markdown content for one skill, chunking if necessary."""
+    log.info("  ▶ Generazione skill: %s", descriptor.name)
+    chunks = chunk_text(document_md, config.max_chars, config.overlap)
 
-    prompt = SUB_SKILL_PROMPT.format(
+    if len(chunks) == 1:
+        # Single-chunk path – direct generation
+        prompt = SUB_SKILL_CHUNK_PROMPT.format(
+            skill_format_rules=SKILL_FORMAT_RULES,
+            skill_name=descriptor.name,
+            skill_description=descriptor.description,
+            section_hint=descriptor.section_hint,
+            filename=config.input_path.name,
+            chunk_index=1,
+            total_chunks=1,
+            chunk_text=chunks[0],
+        )
+        t0 = time.monotonic()
+        result = call_llm(
+            config,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            label=f"{descriptor.name}[1/1]",
+        ).strip()
+        log.info("  ✓ %s  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(result))
+        return result
+
+    # Multi-chunk path – collect partials then merge
+    partials: List[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        log.info("  [%d/%d] Chunk di %s ...", i, len(chunks), descriptor.name)
+        prompt = SUB_SKILL_CHUNK_PROMPT.format(
+            skill_format_rules=SKILL_FORMAT_RULES,
+            skill_name=descriptor.name,
+            skill_description=descriptor.description,
+            section_hint=descriptor.section_hint,
+            filename=config.input_path.name,
+            chunk_index=i,
+            total_chunks=len(chunks),
+            chunk_text=chunk,
+        )
+        partial = call_llm(
+            config,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            label=f"{descriptor.name}[{i}/{len(chunks)}]",
+        ).strip()
+        partials.append(partial)
+        if i < len(chunks):
+            time.sleep(0.2)
+
+    # Merge partials into one coherent skill file
+    log.info("  Merge %d parti per skill %s ...", len(partials), descriptor.name)
+    numbered = "\n\n".join(
+        f"--- PARTIAL {i+1}/{len(partials)} ---\n{p}" for i, p in enumerate(partials)
+    )
+    merge_prompt = SUB_SKILL_MERGE_PROMPT.format(
         skill_format_rules=SKILL_FORMAT_RULES,
         skill_name=descriptor.name,
         skill_description=descriptor.description,
-        section_hint=descriptor.section_hint,
-        filename=config.input_path.name,
-        source_type=config.input_path.suffix.lower().lstrip("."),
-        document_text=truncated,
+        partials=numbered,
     )
-
-    t_start = time.monotonic()
-    content = call_chat_completion(
+    t0 = time.monotonic()
+    merged = call_llm(
         config,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": merge_prompt},
         ],
-        label=f"sub-skill:{descriptor.name}",
+        label=f"{descriptor.name}[merge]",
     ).strip()
-    elapsed = time.monotonic() - t_start
-
-    log.info("  ✓ %s completato in %.1fs  (%d caratteri)", descriptor.name, elapsed, len(content))
-    return content
+    log.info("  ✓ %s merged  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(merged))
+    return merged
 
 
 # ---------------------------------------------------------------------------
-# Phase C – generate main skill
+# Phase C – generate main skill (multi mode only)
 # ---------------------------------------------------------------------------
 
 def generate_main_skill(
     config: Config,
-    document_text: str,
+    document_md: str,
     descriptors: List[SubSkillDescriptor],
-) -> str:
-    """Genera la skill principale che referenzia tutti i sub-skill."""
+) -> tuple[str, str]:
     log.info("--- Fase C: Generazione skill principale ---")
-
-    main_name = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "main_skill"
-    main_description = (
-        f"Master skill for {config.input_path.name}. "
-        "Load this to understand which sub-skill to use for a given task."
+    stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "main"
+    main_name = stem
+    main_desc = (
+        f"Master index for {config.input_path.name}. "
+        "Load to discover which sub-skill to use for a given task."
     )
 
-    sub_skills_lines = []
-    for d in descriptors:
-        sub_skills_lines.append(
-            f"- name: {d.name}\n"
-            f"  file: {d.name}.md\n"
-            f"  description: {d.description}\n"
-            f"  section_hint: {d.section_hint}"
-        )
-    sub_skills_list = "\n".join(sub_skills_lines)
+    sub_list = "\n".join(
+        f"- name: {d.name}\n  file: {d.name}.md\n"
+        f"  description: {d.description}\n  section_hint: {d.section_hint}"
+        for d in descriptors
+    )
 
     prompt = MAIN_SKILL_PROMPT.format(
         skill_format_rules=SKILL_FORMAT_RULES,
         filename=config.input_path.name,
         main_skill_name=main_name,
-        main_skill_description=main_description,
-        sub_skills_list=sub_skills_list,
-        document_excerpt=document_text[:4000],
+        main_skill_description=main_desc,
+        sub_skills_list=sub_list,
+        document_excerpt=document_md[:4000],
     )
-
-    t_start = time.monotonic()
-    content = call_chat_completion(
+    t0 = time.monotonic()
+    content = call_llm(
         config,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        label="main skill",
+        label="main",
     ).strip()
-    elapsed = time.monotonic() - t_start
-
-    log.info("Skill principale generata in %.1fs  (%d caratteri)", elapsed, len(content))
+    log.info("Skill principale pronta  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
     return content, main_name
 
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Output
 # ---------------------------------------------------------------------------
 
-def save_skill(output_dir: Path, skill_name: str, content: str) -> Path:
-    """Salva il contenuto di una skill nel file <output_dir>/<skill_name>.md."""
+def save_skill(output_dir: Path, name: str, content: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{skill_name}.md"
-    out_path.write_text(content, encoding="utf-8")
-    log.info("  Salvato: %s", out_path)
-    return out_path
+    path = output_dir / f"{name}.md"
+    path.write_text(content, encoding="utf-8")
+    log.info("  ✓ Salvato: %s", path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -631,41 +769,48 @@ def save_skill(output_dir: Path, skill_name: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def generate_skills(config: Config) -> List[Path]:
-    """Esegue l'intera pipeline multi-skill e restituisce i percorsi dei file generati."""
-    t_pipeline_start = time.monotonic()
-    log.info("=== Skill Generator (multi-skill) avviato ===")
+    t0 = time.monotonic()
+    log.info("=== Skill Generator avviato ===")
     log.info("Sorgente  : %s", config.input_path)
-    log.info("Output dir: %s", config.output_dir)
-    log.info("Modello   : %s  @ %s", config.model, config.base_url)
+    log.info("Output    : %s", config.output_dir)
+    log.info("Modello   : %s @ %s", config.model, config.base_url)
 
-    # --- Fase 1: estrazione testo ---
-    log.info("--- Fase 1/4: Estrazione testo ---")
-    document_text = read_input_file(config.input_path)
+    # 1. Extract raw text
+    log.info("--- 1/4  Estrazione testo ---")
+    raw = read_raw_text(config.input_path)
 
-    # --- Fase 2: identificazione sub-skill ---
-    log.info("--- Fase 2/4: Identificazione sub-skill ---")
-    descriptors = identify_sub_skills(config, document_text)
+    # 2. Convert to clean Markdown (intermediate representation)
+    log.info("--- 2/4  Conversione in Markdown ---")
+    document_md = document_to_md(raw)
+    log.info("Markdown intermedio: %d chars", len(document_md))
 
-    # --- Fase 3: generazione sub-skill ---
-    log.info("--- Fase 3/4: Generazione sub-skill (%d) ---", len(descriptors))
-    saved_paths: List[Path] = []
-    for i, descriptor in enumerate(descriptors, start=1):
-        log.info("[%d/%d] %s", i, len(descriptors), descriptor.name)
-        content = generate_sub_skill(config, descriptor, document_text)
-        path = save_skill(config.output_dir, descriptor.name, content)
-        saved_paths.append(path)
-        if i < len(descriptors):
-            time.sleep(0.2)
+    # 3. Identify required skills
+    log.info("--- 3/4  Identificazione skill ---")
+    plan = identify_skills(config, document_md)
 
-    # --- Fase 4: generazione skill principale ---
-    log.info("--- Fase 4/4: Generazione skill principale ---")
-    main_content, main_name = generate_main_skill(config, document_text, descriptors)
-    main_path = save_skill(config.output_dir, main_name, main_content)
-    saved_paths.append(main_path)
+    # 4. Generate skill files
+    log.info("--- 4/4  Generazione file skill ---")
+    saved: List[Path] = []
 
-    elapsed_total = time.monotonic() - t_pipeline_start
-    log.info("=== Pipeline completata in %.1fs — %d file generati ===", elapsed_total, len(saved_paths))
-    return saved_paths
+    if plan.single:
+        # Single skill mode – one file, no subfolder index needed
+        descriptor = plan.skills[0]
+        content = generate_sub_skill(config, descriptor, document_md)
+        saved.append(save_skill(config.output_dir, descriptor.name, content))
+    else:
+        # Multi-skill mode – generate each sub-skill then the main index
+        for i, descriptor in enumerate(plan.skills, 1):
+            log.info("[%d/%d] %s", i, len(plan.skills), descriptor.name)
+            content = generate_sub_skill(config, descriptor, document_md)
+            saved.append(save_skill(config.output_dir, descriptor.name, content))
+            if i < len(plan.skills):
+                time.sleep(0.2)
+
+        main_content, main_name = generate_main_skill(config, document_md, plan.skills)
+        saved.append(save_skill(config.output_dir, main_name, main_content))
+
+    log.info("=== Completato in %.1fs — %d file generati ===", time.monotonic() - t0, len(saved))
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +818,6 @@ def generate_skills(config: Config) -> List[Path]:
 # ---------------------------------------------------------------------------
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Punto d'ingresso CLI del programma."""
     try:
         config = parse_args(argv if argv is not None else sys.argv[1:])
         global log
