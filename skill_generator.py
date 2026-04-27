@@ -47,6 +47,8 @@ DEFAULT_OVERLAP = 1200
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_OUTPUT_TOKENS = 4000
+DEFAULT_MAX_RETRIES = 3          # max retry attempts for transient LLM errors
+DEFAULT_RETRY_BACKOFF = 5.0      # base backoff seconds (doubled each attempt)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,6 +68,16 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 log: logging.Logger = logging.getLogger("skill_generator")
+
+
+def _safe_strip(value: object, label: str = "LLM response") -> str:
+    """Return value.strip() if value is a non-empty string, else raise RuntimeError."""
+    if not isinstance(value, str):
+        raise RuntimeError(
+            f"{label} returned non-string content: {type(value).__name__!r} — value: {value!r:.200}"
+        )
+    return value.strip()
+
 
 # ---------------------------------------------------------------------------
 # Skill output format (injected into every generation prompt)
@@ -200,6 +212,8 @@ Instructions:
 5. Begin with the YAML frontmatter ONLY on chunk 1:
    name: {skill_name}
    description: {skill_description}
+6. If this chunk contains NO content relevant to the topic, reply with exactly:
+   NO_RELEVANT_CONTENT
 
 Chunk:
 <chunk>
@@ -286,7 +300,7 @@ class Config:
     api_key: str
     model: str
     input_path: Path
-    output_dir: Path          # auto-derived if not overridden
+    output_dir: Path
     max_chars: int = DEFAULT_MAX_CHARS
     overlap: int = DEFAULT_OVERLAP
     temperature: float = DEFAULT_TEMPERATURE
@@ -315,10 +329,8 @@ def parse_args(argv: Sequence[str]) -> Config:
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"))
-    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS,
-                        help="Max chars per chunk inviato all'LLM")
-    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP,
-                        help="Overlap in chars tra chunk consecutivi")
+    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
+    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
@@ -335,7 +347,6 @@ def parse_args(argv: Sequence[str]) -> Config:
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        # Auto-derive: <input_stem>-skills/ next to the input file
         stem = re.sub(r"[^a-z0-9_\-]", "_", input_path.stem.lower()).strip("_-") or "skill"
         output_dir = input_path.parent / f"{stem}-skills"
 
@@ -359,13 +370,10 @@ def parse_args(argv: Sequence[str]) -> Config:
 # ---------------------------------------------------------------------------
 
 def read_raw_text(input_path: Path) -> str:
-    """Estrae il testo grezzo da PDF o DOCX."""
     if not input_path.exists():
         raise FileNotFoundError(f"File non trovato: {input_path}")
-
     suffix = input_path.suffix.lower()
     log.info("Lettura file: %s  (%s)", input_path.name, suffix.lstrip(".").upper())
-
     if suffix == ".pdf":
         return _extract_pdf(input_path)
     if suffix == ".docx":
@@ -400,19 +408,16 @@ def _extract_docx(path: Path) -> str:
         if isinstance(block, Paragraph):
             t = block.text.strip()
             if t:
-                # Preserve heading level as Markdown heading
                 style = (block.style.name or "").lower()
                 if style.startswith("heading"):
                     try:
                         level = int(style.split()[-1])
                     except ValueError:
                         level = 2
-                    hashes = "#" * max(1, min(level, 6))
-                    blocks.append(f"{hashes} {t}")
+                    blocks.append("#" * max(1, min(level, 6)) + f" {t}")
                 else:
                     blocks.append(t)
         elif isinstance(block, Table):
-            # Render table as Markdown table
             rows = block.rows
             if not rows:
                 continue
@@ -427,17 +432,10 @@ def _extract_docx(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Document → clean Markdown conversion
+# Document → clean Markdown
 # ---------------------------------------------------------------------------
 
 def document_to_md(raw_text: str) -> str:
-    """
-    Converts raw extracted text into clean Markdown that an LLM can read well.
-    - Normalises whitespace.
-    - Removes OCR noise (repeated special chars, isolated single chars on lines).
-    - Ensures code-like lines (indented 4+ spaces or starting with common CLI tokens)
-      are wrapped in fenced code blocks.
-    """
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\u00a0", " ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
@@ -449,21 +447,17 @@ def document_to_md(raw_text: str) -> str:
 
     for line in lines:
         stripped = line.rstrip()
-
-        # Detect code block entry: line indented >=4 spaces or starts with $ / > (shell)
         is_code_line = (
             re.match(r"^    \S", stripped)
             or re.match(r"^\$\s", stripped)
             or re.match(r"^>>> ", stripped)
         )
-
         if is_code_line and not in_code:
             result.append("```")
             in_code = True
         elif not is_code_line and in_code:
             result.append("```")
             in_code = False
-
         result.append(stripped)
 
     if in_code:
@@ -477,10 +471,8 @@ def document_to_md(raw_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
-    """Splits text into overlapping chunks, preferring paragraph boundaries."""
     if len(text) <= max_chars:
         return [text]
-
     chunks: List[str] = []
     start = 0
     while start < len(text):
@@ -497,7 +489,6 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
         if end >= len(text):
             break
         start = max(0, end - overlap)
-
     log.info("Chunking: %d chunk  (max_chars=%d, overlap=%d)", len(chunks), max_chars, overlap)
     for i, c in enumerate(chunks, 1):
         log.debug("  Chunk %d: %d chars", i, len(c))
@@ -505,7 +496,7 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# HTTP
+# HTTP  (with retry + None-guard)
 # ---------------------------------------------------------------------------
 
 def _headers(api_key: str) -> dict:
@@ -518,6 +509,18 @@ def call_llm(
     response_format: Optional[dict] = None,
     label: str = "LLM",
 ) -> str:
+    """
+    Call the LLM endpoint and return the response content as a str.
+
+    Raises RuntimeError if:
+    - HTTP status >= 400 (after retries)
+    - Response JSON is malformed
+    - content field is None, empty, or not a string (after retries)
+
+    Retries up to DEFAULT_MAX_RETRIES times with exponential backoff on:
+    - HTTP 5xx errors
+    - content is None or empty string
+    """
     payload: dict = {
         "model": config.model,
         "messages": messages,
@@ -528,28 +531,70 @@ def call_llm(
         payload["response_format"] = response_format
 
     url = f"{config.base_url}/chat/completions"
-    log.debug("  → POST %s  [%s]", url, label)
-    t0 = time.monotonic()
-    resp = requests.post(url, headers=_headers(config.api_key), json=payload, timeout=config.timeout)
-    elapsed = time.monotonic() - t0
+    last_exc: Optional[Exception] = None
 
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+    for attempt in range(1, DEFAULT_MAX_RETRIES + 1):
+        try:
+            log.debug("  → POST %s  [%s]  attempt %d/%d", url, label, attempt, DEFAULT_MAX_RETRIES)
+            t0 = time.monotonic()
+            resp = requests.post(
+                url,
+                headers=_headers(config.api_key),
+                json=payload,
+                timeout=config.timeout,
+            )
+            elapsed = time.monotonic() - t0
+            log.debug("  ← %.1fs  [%s]  status=%d", elapsed, label, resp.status_code)
 
-    data = resp.json()
-    log.debug("  ← %.1fs  [%s]", elapsed, label)
+            # Transient server error → retry
+            if resp.status_code >= 500:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Risposta inattesa: {json.dumps(data)[:800]}") from exc
+            # Hard client error → fail immediately
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
-    if usage := data.get("usage"):
-        log.debug("  tokens prompt=%s compl=%s total=%s",
-                  usage.get("prompt_tokens", "?"),
-                  usage.get("completion_tokens", "?"),
-                  usage.get("total_tokens", "?"))
-    return content
+            data = resp.json()
+
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"Risposta malformata: {json.dumps(data)[:600]}") from exc
+
+            # Guard: content must be a non-empty string
+            if content is None:
+                raise RuntimeError("content è None nella risposta LLM")
+            if not isinstance(content, str):
+                raise RuntimeError(
+                    f"content non è una stringa: {type(content).__name__!r} — {content!r:.200}"
+                )
+            if not content.strip():
+                raise RuntimeError("content è una stringa vuota nella risposta LLM")
+
+            if usage := data.get("usage"):
+                log.debug(
+                    "  tokens prompt=%s compl=%s total=%s",
+                    usage.get("prompt_tokens", "?"),
+                    usage.get("completion_tokens", "?"),
+                    usage.get("total_tokens", "?"),
+                )
+
+            return content  # ← always a non-empty str here
+
+        except RuntimeError as exc:
+            last_exc = exc
+            is_client_error = "HTTP 4" in str(exc)
+            if is_client_error or attempt == DEFAULT_MAX_RETRIES:
+                raise
+            backoff = DEFAULT_RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.warning(
+                "  [%s] attempt %d/%d failed: %s — retry in %.0fs",
+                label, attempt, DEFAULT_MAX_RETRIES, exc, backoff,
+            )
+            time.sleep(backoff)
+
+    # Should never reach here, but satisfy type checker
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -557,11 +602,7 @@ def call_llm(
 # ---------------------------------------------------------------------------
 
 def identify_skills(config: Config, document_md: str) -> IdentifyResult:
-    """Asks the LLM to return a JSON plan: {single, skills[]}."""
     log.info("--- Fase A: Identificazione skill ---")
-
-    # For the identification call we send up to max_chars of the document
-    # (the LLM only needs an overview to decide the structure)
     excerpt = document_md[:config.max_chars]
 
     prompt = IDENTIFY_SKILLS_PROMPT.format(
@@ -585,7 +626,6 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"JSON non valido nella fase A: {raw[:600]}") from exc
 
-    # Normalise: accept bare list (legacy) or {single, skills} object
     if isinstance(parsed, list):
         raw_list = parsed
         single = len(parsed) == 1
@@ -593,7 +633,6 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
         single = bool(parsed.get("single", False))
         raw_list = parsed.get("skills") or []
         if not raw_list:
-            # fallback: find first list value
             raw_list = next((v for v in parsed.values() if isinstance(v, list)), [])
 
     descriptors: List[SubSkillDescriptor] = []
@@ -626,16 +665,14 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
 
 
 # ---------------------------------------------------------------------------
-# Phase B – generate one sub-skill (with chunking + merge)
+# Phase B – generate one sub-skill (chunking + merge)
 # ---------------------------------------------------------------------------
 
 def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_md: str) -> str:
-    """Generates the Markdown content for one skill, chunking if necessary."""
     log.info("  ▶ Generazione skill: %s", descriptor.name)
     chunks = chunk_text(document_md, config.max_chars, config.overlap)
 
     if len(chunks) == 1:
-        # Single-chunk path – direct generation
         prompt = SUB_SKILL_CHUNK_PROMPT.format(
             skill_format_rules=SKILL_FORMAT_RULES,
             skill_name=descriptor.name,
@@ -647,18 +684,21 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
             chunk_text=chunks[0],
         )
         t0 = time.monotonic()
-        result = call_llm(
-            config,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
+        result = _safe_strip(
+            call_llm(
+                config,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                label=f"{descriptor.name}[1/1]",
+            ),
             label=f"{descriptor.name}[1/1]",
-        ).strip()
+        )
         log.info("  ✓ %s  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(result))
         return result
 
-    # Multi-chunk path – collect partials then merge
+    # Multi-chunk: collect partials
     partials: List[str] = []
     for i, chunk in enumerate(chunks, 1):
         log.info("  [%d/%d] Chunk di %s ...", i, len(chunks), descriptor.name)
@@ -672,22 +712,44 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
             total_chunks=len(chunks),
             chunk_text=chunk,
         )
-        partial = call_llm(
-            config,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            label=f"{descriptor.name}[{i}/{len(chunks)}]",
-        ).strip()
-        partials.append(partial)
+        try:
+            raw = _safe_strip(
+                call_llm(
+                    config,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    label=f"{descriptor.name}[{i}/{len(chunks)}]",
+                ),
+                label=f"{descriptor.name}[{i}/{len(chunks)}]",
+            )
+        except RuntimeError as exc:
+            log.warning("  Chunk %d/%d skipped (LLM error): %s", i, len(chunks), exc)
+            raw = ""
+
+        # Skip sentinel and empty responses
+        if raw and raw.strip().upper() != "NO_RELEVANT_CONTENT":
+            partials.append(raw)
+        else:
+            log.debug("  Chunk %d/%d: no relevant content, skipped.", i, len(chunks))
+
         if i < len(chunks):
             time.sleep(0.2)
 
-    # Merge partials into one coherent skill file
+    if not partials:
+        raise RuntimeError(
+            f"Tutti i chunk per la skill '{descriptor.name}' hanno prodotto output vuoto o non rilevante."
+        )
+
+    if len(partials) == 1:
+        log.info("  Solo 1 partial valido per %s — nessun merge necessario.", descriptor.name)
+        return partials[0]
+
+    # Merge
     log.info("  Merge %d parti per skill %s ...", len(partials), descriptor.name)
     numbered = "\n\n".join(
-        f"--- PARTIAL {i+1}/{len(partials)} ---\n{p}" for i, p in enumerate(partials)
+        f"--- PARTIAL {i + 1}/{len(partials)} ---\n{p}" for i, p in enumerate(partials)
     )
     merge_prompt = SUB_SKILL_MERGE_PROMPT.format(
         skill_format_rules=SKILL_FORMAT_RULES,
@@ -696,20 +758,23 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
         partials=numbered,
     )
     t0 = time.monotonic()
-    merged = call_llm(
-        config,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": merge_prompt},
-        ],
+    merged = _safe_strip(
+        call_llm(
+            config,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": merge_prompt},
+            ],
+            label=f"{descriptor.name}[merge]",
+        ),
         label=f"{descriptor.name}[merge]",
-    ).strip()
+    )
     log.info("  ✓ %s merged  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(merged))
     return merged
 
 
 # ---------------------------------------------------------------------------
-# Phase C – generate main skill (multi mode only)
+# Phase C – generate main skill
 # ---------------------------------------------------------------------------
 
 def generate_main_skill(
@@ -719,37 +784,37 @@ def generate_main_skill(
 ) -> tuple[str, str]:
     log.info("--- Fase C: Generazione skill principale ---")
     stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "main"
-    main_name = stem
     main_desc = (
         f"Master index for {config.input_path.name}. "
         "Load to discover which sub-skill to use for a given task."
     )
-
     sub_list = "\n".join(
         f"- name: {d.name}\n  file: {d.name}.md\n"
         f"  description: {d.description}\n  section_hint: {d.section_hint}"
         for d in descriptors
     )
-
     prompt = MAIN_SKILL_PROMPT.format(
         skill_format_rules=SKILL_FORMAT_RULES,
         filename=config.input_path.name,
-        main_skill_name=main_name,
+        main_skill_name=stem,
         main_skill_description=main_desc,
         sub_skills_list=sub_list,
         document_excerpt=document_md[:4000],
     )
     t0 = time.monotonic()
-    content = call_llm(
-        config,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+    content = _safe_strip(
+        call_llm(
+            config,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            label="main",
+        ),
         label="main",
-    ).strip()
+    )
     log.info("Skill principale pronta  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
-    return content, main_name
+    return content, stem
 
 
 # ---------------------------------------------------------------------------
@@ -775,37 +840,30 @@ def generate_skills(config: Config) -> List[Path]:
     log.info("Output    : %s", config.output_dir)
     log.info("Modello   : %s @ %s", config.model, config.base_url)
 
-    # 1. Extract raw text
     log.info("--- 1/4  Estrazione testo ---")
     raw = read_raw_text(config.input_path)
 
-    # 2. Convert to clean Markdown (intermediate representation)
     log.info("--- 2/4  Conversione in Markdown ---")
     document_md = document_to_md(raw)
     log.info("Markdown intermedio: %d chars", len(document_md))
 
-    # 3. Identify required skills
     log.info("--- 3/4  Identificazione skill ---")
     plan = identify_skills(config, document_md)
 
-    # 4. Generate skill files
     log.info("--- 4/4  Generazione file skill ---")
     saved: List[Path] = []
 
     if plan.single:
-        # Single skill mode – one file, no subfolder index needed
         descriptor = plan.skills[0]
         content = generate_sub_skill(config, descriptor, document_md)
         saved.append(save_skill(config.output_dir, descriptor.name, content))
     else:
-        # Multi-skill mode – generate each sub-skill then the main index
         for i, descriptor in enumerate(plan.skills, 1):
             log.info("[%d/%d] %s", i, len(plan.skills), descriptor.name)
             content = generate_sub_skill(config, descriptor, document_md)
             saved.append(save_skill(config.output_dir, descriptor.name, content))
             if i < len(plan.skills):
                 time.sleep(0.2)
-
         main_content, main_name = generate_main_skill(config, document_md, plan.skills)
         saved.append(save_skill(config.output_dir, main_name, main_content))
 
