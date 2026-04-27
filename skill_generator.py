@@ -5,24 +5,25 @@ Pipeline:
   1. Converti il documento sorgente in Markdown intermedio (document_to_md).
   2. Chiama l'LLM (con few-shot) per decidere quante skill servono e restituire
      un descrittore JSON {"single": bool, "skills": [...]}.
-  3a. Se single=True  → genera SKILL.md nella output dir.
-  3b. Se single=False → genera references/<name>.md per ogni sub-skill,
-      poi genera SKILL.md (index) che li referenzia.
-  4. Output layout:
-       <output_dir>/
-           SKILL.md          ← main / only skill (always this exact name)
-           references/
-               <name>.md     ← one file per sub-skill (multi mode only)
+  3a. Se single=True  → genera <output_dir>/<skill-name>/SKILL.md
+  3b. Se single=False → genera:
+        <output_dir>/<main-skill-name>/SKILL.md            (index)
+        <output_dir>/<main-skill-name>/references/<sub>.md (sub-skills)
 
 Formato di output obbligatorio per ogni skill (Roo Code compatible):
 
     ---
-    name: skillname
-    description: when to use it
-    agents: [main_agent, general_purpose]
+    name: skill-name-in-kebab-case
+    description: One sentence answering "when should an agent load this skill?".
     ---
 
     Skill body in Markdown.
+
+Regole di naming Roo Code:
+  - Il campo `name` deve corrispondere ESATTAMENTE al nome della cartella che contiene SKILL.md
+  - Solo lowercase letters, numeri e trattini (hyphens). NO underscores.
+  - 1–64 caratteri, no leading/trailing/consecutive hyphens.
+  - Solo `name` e `description` sono campi obbligatori (no `agents`).
 """
 
 from __future__ import annotations
@@ -55,9 +56,9 @@ DEFAULT_MAX_OUTPUT_TOKENS = 4000
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 5.0
 
-# Fixed output filenames / folders
 MAIN_SKILL_FILENAME = "SKILL.md"
 REFERENCES_DIR = "references"
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,6 +89,24 @@ def _safe_strip(value: object, label: str = "LLM response") -> str:
     return value.strip()
 
 
+def _to_skill_name(raw: str) -> str:
+    """
+    Convert any string to a valid Roo Code skill name:
+    - lowercase
+    - only letters, digits, hyphens
+    - no leading/trailing/consecutive hyphens
+    - max 64 chars
+    """
+    s = raw.lower()
+    s = re.sub(r"[_\s]+", "-", s)          # underscores/spaces -> hyphens
+    s = re.sub(r"[^a-z0-9\-]", "", s)      # remove all other chars
+    s = re.sub(r"-{2,}", "-", s)           # collapse consecutive hyphens
+    s = s.strip("-")                        # remove leading/trailing hyphens
+    s = s[:64]                              # enforce max length
+    s = s.rstrip("-")                       # remove trailing hyphen after truncation
+    return s or "skill"
+
+
 # ---------------------------------------------------------------------------
 # Skill output format (injected into every generation prompt)
 # ---------------------------------------------------------------------------
@@ -98,22 +117,23 @@ SKILL OUTPUT FORMAT — mandatory for every skill file (Roo Code compatible):
 Every output file MUST start with a YAML frontmatter block:
 
 ---
-name: skillname_in_snake_case
+name: skill-name-in-kebab-case
 description: One sentence answering "when should an agent load this skill?".
-agents: [main_agent, general_purpose]
 ---
 
 Skill body in Markdown.
 
-Rules:
+Roo Code naming rules (CRITICAL — violations make the skill invisible):
+- `name`: ONLY lowercase letters, digits, and hyphens. NO underscores, NO spaces.
+  Valid: `redis-caching`, `spring-boot-setup`, `kafka-producer`
+  INVALID: `redis_caching`, `Spring Boot Setup`, `kafka--producer`
+- `name` must exactly match the directory name that contains SKILL.md.
+- 1–64 characters; no leading, trailing, or consecutive hyphens.
+- `description`: one concise sentence, no quotes around the value.
+- Only `name` and `description` are required — do NOT add `agents` or other fields.
 - The frontmatter MUST be the very first content — no blank lines before the opening ---.
-- `name`: lowercase snake_case, no spaces, no special chars except underscores.
-- `description`: one concise sentence (no quotes around the value).
-- `agents`: always include exactly `[main_agent, general_purpose]` unless instructed otherwise.
 - After the closing --- leave exactly ONE blank line, then start the Markdown body.
-- Do NOT put YAML syntax inside the Markdown body.
-- Do NOT wrap the entire output in a fenced code block.
-- The very first line of the file must be --- (the opening frontmatter delimiter).
+- Do NOT wrap the output in a fenced code block.
 """
 
 # ---------------------------------------------------------------------------
@@ -139,7 +159,7 @@ Core rules:
 """
 
 # ---------------------------------------------------------------------------
-# Prompt: Phase A – identify skills (with few-shot examples)
+# Prompt: Phase A – identify skills
 # ---------------------------------------------------------------------------
 
 IDENTIFY_SKILLS_PROMPT = """\
@@ -152,7 +172,7 @@ Schema:
   "single": <true if ONE skill file is sufficient, false if multiple are needed>,
   "skills": [
     {{
-      "name": "<snake_case identifier>",
+      "name": "<kebab-case identifier: lowercase letters, digits, hyphens ONLY>",
       "description": "<one sentence: when should an agent load this skill?>",
       "section_hint": "<short phrase locating this topic in the document>"
     }}
@@ -163,24 +183,24 @@ Rules:
 - When `single` is true, `skills` contains exactly ONE entry for the whole document.
 - When `single` is false, `skills` contains 2–8 entries (merge closely related topics).
 - Never return more than 8 skills.
-- `name` must be lowercase snake_case.
+- `name` must be kebab-case: lowercase, letters/digits/hyphens only. NO underscores.
 
 --- FEW-SHOT EXAMPLES ---
 
 Example 1 — simple, single-topic document:
 Input document title: "Redis Cache Patterns"
 Expected output:
-{{"single": true, "skills": [{{"name": "redis_cache_patterns", "description": "Load when implementing or troubleshooting Redis caching strategies.", "section_hint": "entire document"}}]}}
+{{"single": true, "skills": [{{"name": "redis-cache-patterns", "description": "Load when implementing or troubleshooting Redis caching strategies.", "section_hint": "entire document"}}]}}
 
 Example 2 — multi-topic guide:
 Input document title: "Python Data Engineering Handbook"
 Expected output:
-{{"single": false, "skills": [{{"name": "pandas_dataframe_ops", "description": "Load when performing data manipulation with pandas DataFrames.", "section_hint": "Section 2 – Pandas"}}, {{"name": "kafka_python_producer", "description": "Load when setting up a Kafka producer in Python.", "section_hint": "Section 5 – Kafka integration"}}, {{"name": "spark_job_submission", "description": "Load when submitting or tuning a PySpark job.", "section_hint": "Section 7 – Spark"}}]}}
+{{"single": false, "skills": [{{"name": "pandas-dataframe-ops", "description": "Load when performing data manipulation with pandas DataFrames.", "section_hint": "Section 2 – Pandas"}}, {{"name": "kafka-python-producer", "description": "Load when setting up a Kafka producer in Python.", "section_hint": "Section 5 – Kafka integration"}}, {{"name": "spark-job-submission", "description": "Load when submitting or tuning a PySpark job.", "section_hint": "Section 7 – Spark"}}]}}
 
 Example 3 — broad reference manual:
 Input document title: "AWS Infrastructure Runbook"
 Expected output:
-{{"single": false, "skills": [{{"name": "aws_vpc_setup", "description": "Load when creating or modifying a VPC configuration.", "section_hint": "Chapter 1 – Networking"}}, {{"name": "aws_iam_policies", "description": "Load when writing or auditing IAM policies.", "section_hint": "Chapter 3 – IAM"}}, {{"name": "aws_rds_backup", "description": "Load when configuring RDS automated backups or restores.", "section_hint": "Chapter 6 – Databases"}}]}}
+{{"single": false, "skills": [{{"name": "aws-vpc-setup", "description": "Load when creating or modifying a VPC configuration.", "section_hint": "Chapter 1 – Networking"}}, {{"name": "aws-iam-policies", "description": "Load when writing or auditing IAM policies.", "section_hint": "Chapter 3 – IAM"}}, {{"name": "aws-rds-backup", "description": "Load when configuring RDS automated backups or restores.", "section_hint": "Chapter 6 – Databases"}}]}}
 
 --- END OF EXAMPLES ---
 
@@ -221,12 +241,12 @@ Instructions:
    ## Constraints
 4. If this is not chunk 1, output ONLY new sections/content not already covered;
    do not repeat the frontmatter or sections already written.
-5. Begin with the YAML frontmatter ONLY on chunk 1 (include the agents field):
+5. Begin with the YAML frontmatter ONLY on chunk 1:
    ---
    name: {skill_name}
    description: {skill_description}
-   agents: [main_agent, general_purpose]
    ---
+   (name must use hyphens only, NO underscores)
 6. If this chunk contains NO content relevant to the topic, reply with exactly:
    NO_RELEVANT_CONTENT
 
@@ -237,7 +257,7 @@ Chunk:
 """
 
 # ---------------------------------------------------------------------------
-# Prompt: Phase B merge – merge chunk outputs into one skill
+# Prompt: Phase B merge
 # ---------------------------------------------------------------------------
 
 SUB_SKILL_MERGE_PROMPT = """\
@@ -253,15 +273,16 @@ Partial outputs (in order):
 {partials}
 
 Rules:
-- Output a single skill file starting with the YAML frontmatter (name, description, agents).
+- Output a single skill file starting with the YAML frontmatter (name + description only).
 - The very first line must be --- (opening frontmatter delimiter).
+- name must use hyphens only (NO underscores).
 - Deduplicate aggressively; keep the most complete/authoritative version.
 - Preserve ALL code blocks verbatim; never rewrite them.
 - Sections: ## Purpose / ## When to use / ## Core instructions / ## Examples / ## Constraints
 """
 
 # ---------------------------------------------------------------------------
-# Prompt: Phase C – generate main SKILL.md (multi-skill mode)
+# Prompt: Phase C – generate main SKILL.md
 # ---------------------------------------------------------------------------
 
 MAIN_SKILL_PROMPT = """\
@@ -277,18 +298,17 @@ Sub-skills already generated (saved under references/):
 {sub_skills_list}
 
 Instructions:
-1. Start with the YAML frontmatter:
+1. Start with the YAML frontmatter (name + description only, no other fields):
    ---
    name: {main_skill_name}
    description: {main_skill_description}
-   agents: [main_agent, general_purpose]
    ---
+   (name must use hyphens only, NO underscores)
 2. Write a concise overview of what the document covers (3-6 bullets).
 3. ## Sub-skills section — for each sub-skill:
    ### <name>
    File: `references/<name>.md`
    Load when: <one sentence describing the exact situation>
-   Call: `load_skill("references/<name>")`
 4. ## Quick reference — the most critical cross-cutting rules as a bullet list.
 5. Do NOT duplicate content already in sub-skills; reference, do not repeat.
 6. Keep SKILL.md concise — it is a router/index, not a repeat of the sub-skills.
@@ -306,7 +326,7 @@ Document excerpt (first 4000 chars):
 
 @dataclass
 class SubSkillDescriptor:
-    name: str
+    name: str          # validated kebab-case
     description: str
     section_hint: str
 
@@ -345,9 +365,10 @@ def parse_args(argv: Sequence[str]) -> Config:
         "-o", "--output-dir",
         default=None,
         help=(
-            "Directory di output (default: <input_stem>-skills/ "
-            "nella stessa cartella del file sorgente). "
-            "Contiene sempre SKILL.md e, in modalità multi, references/<name>.md."
+            "Directory radice di output. "
+            "Default: cartella nella stessa posizione del file sorgente. "
+            "Può puntare direttamente a ~/.roo/skills/ o .roo/skills/ "
+            "così le skill sono immediatamente disponibili in Roo Code."
         ),
     )
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
@@ -371,8 +392,8 @@ def parse_args(argv: Sequence[str]) -> Config:
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        stem = re.sub(r"[^a-z0-9_\-]", "_", input_path.stem.lower()).strip("_-") or "skill"
-        output_dir = input_path.parent / f"{stem}-skills"
+        raw_stem = re.sub(r"[^a-z0-9_\-]", "_", input_path.stem.lower()).strip("_-") or "skill"
+        output_dir = input_path.parent / f"{raw_stem}-skills"
 
     return Config(
         base_url=args.base_url.rstrip("/"),
@@ -390,7 +411,7 @@ def parse_args(argv: Sequence[str]) -> Config:
 
 
 # ---------------------------------------------------------------------------
-# File reading – raw extraction
+# File reading
 # ---------------------------------------------------------------------------
 
 def read_raw_text(input_path: Path) -> str:
@@ -520,7 +541,7 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# HTTP  (with retry + None-guard)
+# HTTP (with retry + None-guard)
 # ---------------------------------------------------------------------------
 
 def _headers(api_key: str) -> dict:
@@ -533,18 +554,6 @@ def call_llm(
     response_format: Optional[dict] = None,
     label: str = "LLM",
 ) -> str:
-    """
-    Call the LLM endpoint and return the response content as a str.
-
-    Raises RuntimeError if:
-    - HTTP status >= 400 (after retries)
-    - Response JSON is malformed
-    - content field is None, empty, or not a string (after retries)
-
-    Retries up to DEFAULT_MAX_RETRIES times with exponential backoff on:
-    - HTTP 5xx errors
-    - content is None or empty string
-    """
     payload: dict = {
         "model": config.model,
         "messages": messages,
@@ -562,10 +571,7 @@ def call_llm(
             log.debug("  → POST %s  [%s]  attempt %d/%d", url, label, attempt, DEFAULT_MAX_RETRIES)
             t0 = time.monotonic()
             resp = requests.post(
-                url,
-                headers=_headers(config.api_key),
-                json=payload,
-                timeout=config.timeout,
+                url, headers=_headers(config.api_key), json=payload, timeout=config.timeout,
             )
             elapsed = time.monotonic() - t0
             log.debug("  ← %.1fs  [%s]  status=%d", elapsed, label, resp.status_code)
@@ -576,7 +582,6 @@ def call_llm(
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
             data = resp.json()
-
             try:
                 content = data["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as exc:
@@ -585,11 +590,9 @@ def call_llm(
             if content is None:
                 raise RuntimeError("content è None nella risposta LLM")
             if not isinstance(content, str):
-                raise RuntimeError(
-                    f"content non è una stringa: {type(content).__name__!r} — {content!r:.200}"
-                )
+                raise RuntimeError(f"content non è str: {type(content).__name__!r}")
             if not content.strip():
-                raise RuntimeError("content è una stringa vuota nella risposta LLM")
+                raise RuntimeError("content è vuoto nella risposta LLM")
 
             if usage := data.get("usage"):
                 log.debug(
@@ -598,19 +601,15 @@ def call_llm(
                     usage.get("completion_tokens", "?"),
                     usage.get("total_tokens", "?"),
                 )
-
             return content
 
         except RuntimeError as exc:
             last_exc = exc
-            is_client_error = "HTTP 4" in str(exc)
-            if is_client_error or attempt == DEFAULT_MAX_RETRIES:
+            if "HTTP 4" in str(exc) or attempt == DEFAULT_MAX_RETRIES:
                 raise
             backoff = DEFAULT_RETRY_BACKOFF * (2 ** (attempt - 1))
-            log.warning(
-                "  [%s] attempt %d/%d failed: %s — retry in %.0fs",
-                label, attempt, DEFAULT_MAX_RETRIES, exc, backoff,
-            )
+            log.warning("  [%s] attempt %d/%d failed: %s — retry in %.0fs",
+                        label, attempt, DEFAULT_MAX_RETRIES, exc, backoff)
             time.sleep(backoff)
 
     raise last_exc  # type: ignore[misc]
@@ -656,7 +655,8 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
 
     descriptors: List[SubSkillDescriptor] = []
     for item in raw_list:
-        name = re.sub(r"[^a-z0-9_]", "_", (item.get("name") or "skill").lower()).strip("_")
+        raw_name = (item.get("name") or "skill")
+        name = _to_skill_name(raw_name)   # enforce kebab-case + Roo Code rules
         desc = (item.get("description") or "").strip()
         hint = (item.get("section_hint") or "").strip()
         if name:
@@ -664,7 +664,7 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
 
     if not descriptors:
         log.warning("Nessuna skill identificata; fallback a skill unica.")
-        stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "skill"
+        stem = _to_skill_name(config.input_path.stem)
         descriptors.append(SubSkillDescriptor(
             name=stem,
             description=f"Use when working with {config.input_path.name}.",
@@ -678,13 +678,13 @@ def identify_skills(config: Config, document_md: str) -> IdentifyResult:
     log.info("Modalità: %s  |  skill identificate: %d",
              "SINGOLA" if single else "MULTI", len(descriptors))
     for d in descriptors:
-        log.info("  • %-35s  %s", d.name, d.section_hint)
+        log.info("  • %-40s  %s", d.name, d.section_hint)
 
     return IdentifyResult(single=single, skills=descriptors)
 
 
 # ---------------------------------------------------------------------------
-# Phase B – generate one sub-skill (chunking + merge)
+# Phase B – generate one sub-skill
 # ---------------------------------------------------------------------------
 
 def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_md: str) -> str:
@@ -704,20 +704,15 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
         )
         t0 = time.monotonic()
         result = _safe_strip(
-            call_llm(
-                config,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                label=f"{descriptor.name}[1/1]",
-            ),
+            call_llm(config,
+                     messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                               {"role": "user", "content": prompt}],
+                     label=f"{descriptor.name}[1/1]"),
             label=f"{descriptor.name}[1/1]",
         )
         log.info("  ✓ %s  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(result))
         return result
 
-    # Multi-chunk: collect partials
     partials: List[str] = []
     for i, chunk in enumerate(chunks, 1):
         log.info("  [%d/%d] Chunk di %s ...", i, len(chunks), descriptor.name)
@@ -733,14 +728,10 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
         )
         try:
             raw = _safe_strip(
-                call_llm(
-                    config,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    label=f"{descriptor.name}[{i}/{len(chunks)}]",
-                ),
+                call_llm(config,
+                         messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                                   {"role": "user", "content": prompt}],
+                         label=f"{descriptor.name}[{i}/{len(chunks)}]"),
                 label=f"{descriptor.name}[{i}/{len(chunks)}]",
             )
         except RuntimeError as exc:
@@ -757,11 +748,11 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
 
     if not partials:
         raise RuntimeError(
-            f"Tutti i chunk per la skill '{descriptor.name}' hanno prodotto output vuoto o non rilevante."
+            f"Tutti i chunk per '{descriptor.name}' hanno prodotto output vuoto."
         )
 
     if len(partials) == 1:
-        log.info("  Solo 1 partial valido per %s — nessun merge necessario.", descriptor.name)
+        log.info("  Solo 1 partial valido per %s.", descriptor.name)
         return partials[0]
 
     log.info("  Merge %d parti per skill %s ...", len(partials), descriptor.name)
@@ -776,14 +767,10 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
     )
     t0 = time.monotonic()
     merged = _safe_strip(
-        call_llm(
-            config,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": merge_prompt},
-            ],
-            label=f"{descriptor.name}[merge]",
-        ),
+        call_llm(config,
+                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                           {"role": "user", "content": merge_prompt}],
+                 label=f"{descriptor.name}[merge]"),
         label=f"{descriptor.name}[merge]",
     )
     log.info("  ✓ %s merged  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(merged))
@@ -798,9 +785,9 @@ def generate_main_skill(
     config: Config,
     document_md: str,
     descriptors: List[SubSkillDescriptor],
+    main_name: str,
 ) -> str:
     log.info("--- Fase C: Generazione SKILL.md principale ---")
-    stem = re.sub(r"[^a-z0-9_]", "_", config.input_path.stem.lower()).strip("_") or "main"
     main_desc = (
         f"Master index for {config.input_path.name}. "
         "Load to discover which sub-skill to use for a given task."
@@ -813,21 +800,17 @@ def generate_main_skill(
     prompt = MAIN_SKILL_PROMPT.format(
         skill_format_rules=SKILL_FORMAT_RULES,
         filename=config.input_path.name,
-        main_skill_name=stem,
+        main_skill_name=main_name,
         main_skill_description=main_desc,
         sub_skills_list=sub_list,
         document_excerpt=document_md[:4000],
     )
     t0 = time.monotonic()
     content = _safe_strip(
-        call_llm(
-            config,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            label="main",
-        ),
+        call_llm(config,
+                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                           {"role": "user", "content": prompt}],
+                 label="main"),
         label="main",
     )
     log.info("SKILL.md pronto  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
@@ -838,23 +821,22 @@ def generate_main_skill(
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def save_main_skill(output_dir: Path, content: str) -> Path:
-    """Save the main skill as SKILL.md directly inside output_dir."""
-    _ensure_dir(output_dir)
-    path = output_dir / MAIN_SKILL_FILENAME
+def save_main_skill(skill_dir: Path, content: str) -> Path:
+    """
+    Save SKILL.md inside skill_dir.
+    skill_dir must be named after the skill (e.g. ~/.roo/skills/<skill-name>/).
+    """
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    path = skill_dir / MAIN_SKILL_FILENAME
     path.write_text(content, encoding="utf-8")
     log.info("  ✓ Salvato: %s", path)
     return path
 
 
-def save_sub_skill(output_dir: Path, name: str, content: str) -> Path:
-    """Save a sub-skill as references/<name>.md inside output_dir."""
-    ref_dir = output_dir / REFERENCES_DIR
-    _ensure_dir(ref_dir)
+def save_sub_skill(skill_dir: Path, name: str, content: str) -> Path:
+    """Save references/<name>.md inside the main skill directory."""
+    ref_dir = skill_dir / REFERENCES_DIR
+    ref_dir.mkdir(parents=True, exist_ok=True)
     path = ref_dir / f"{name}.md"
     path.write_text(content, encoding="utf-8")
     log.info("  ✓ Salvato: %s", path)
@@ -886,20 +868,27 @@ def generate_skills(config: Config) -> List[Path]:
     saved: List[Path] = []
 
     if plan.single:
-        # Single mode: generate and save directly as SKILL.md
         descriptor = plan.skills[0]
+        # Skill dir = <output_dir>/<skill-name>/
+        skill_dir = config.output_dir / descriptor.name
         content = generate_sub_skill(config, descriptor, document_md)
-        saved.append(save_main_skill(config.output_dir, content))
+        saved.append(save_main_skill(skill_dir, content))
     else:
-        # Multi mode: sub-skills go to references/, main index to SKILL.md
+        # Derive main skill name from input file stem
+        main_name = _to_skill_name(config.input_path.stem)
+        skill_dir = config.output_dir / main_name
+
+        # Generate sub-skills first
         for i, descriptor in enumerate(plan.skills, 1):
             log.info("[%d/%d] %s", i, len(plan.skills), descriptor.name)
             content = generate_sub_skill(config, descriptor, document_md)
-            saved.append(save_sub_skill(config.output_dir, descriptor.name, content))
+            saved.append(save_sub_skill(skill_dir, descriptor.name, content))
             if i < len(plan.skills):
                 time.sleep(0.2)
-        main_content = generate_main_skill(config, document_md, plan.skills)
-        saved.append(save_main_skill(config.output_dir, main_content))
+
+        # Generate and save SKILL.md index
+        main_content = generate_main_skill(config, document_md, plan.skills, main_name)
+        saved.append(save_main_skill(skill_dir, main_content))
 
     log.info("=== Completato in %.1fs — %d file generati ===", time.monotonic() - t0, len(saved))
     return saved
@@ -915,9 +904,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         global log
         log = setup_logging(verbose=config.verbose)
         paths = generate_skills(config)
-        print(f"\n✓ {len(paths)} file generati in: {config.output_dir}/")
+
+        # Determine the skill root for the summary message
+        if paths:
+            skill_root = paths[0].parent
+            # In multi mode SKILL.md is last; its parent is the skill dir
+            # In single mode the only file is SKILL.md inside the skill dir
+            for p in paths:
+                if p.name == MAIN_SKILL_FILENAME:
+                    skill_root = p.parent
+                    break
+
+        print(f"\n✓ {len(paths)} file generati.")
+        print(f"  Skill directory: {skill_root}")
+        print(f"  Per usarla in Roo Code copia/sposta la cartella in:")
+        print(f"    Global : ~/.roo/skills/{skill_root.name}/")
+        print(f"    Project: .roo/skills/{skill_root.name}/")
         for p in paths:
-            # Show path relative to output_dir for readability
             try:
                 display = p.relative_to(config.output_dir)
             except ValueError:
