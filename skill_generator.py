@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -27,6 +28,44 @@ DEFAULT_OVERLAP = 1200
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_OUTPUT_TOKENS = 4000
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Configura e restituisce il logger principale dell'applicazione.
+
+    Il logger scrive su stderr con timestamp, livello e messaggio.
+    Se ``verbose`` è True il livello è DEBUG, altrimenti INFO.
+
+    Args:
+        verbose: Abilita il livello DEBUG per messaggi di dettaglio aggiuntivi.
+
+    Returns:
+        Logger configurato con il nome ``skill_generator``.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger = logging.getLogger("skill_generator")
+    logger.setLevel(level)
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+log: logging.Logger = logging.getLogger("skill_generator")
+
+# ---------------------------------------------------------------------------
+# Prompt constants
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a senior AI agent skill author.
 Your task is to transform source material extracted from PDF or DOCX files into a HIGH-QUALITY reusable skill file that can be imported into coding agents such as Roo Code, Claude Code style agents, or similar systems.
@@ -155,6 +194,10 @@ Aggregated chunk data:
 """
 
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ChunkResult:
     """Rappresenta il risultato strutturato ottenuto dall'LLM per un singolo chunk."""
@@ -185,7 +228,12 @@ class Config:
     temperature: float = DEFAULT_TEMPERATURE
     timeout: int = DEFAULT_TIMEOUT
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    verbose: bool = False
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args(argv: Sequence[str]) -> Config:
     """Parsa gli argomenti CLI e restituisce una configurazione validata.
@@ -218,6 +266,12 @@ def parse_args(argv: Sequence[str]) -> Config:
         default=DEFAULT_MAX_OUTPUT_TOKENS,
         help="Massimo numero di token generati per chiamata",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="Abilita log DEBUG (include dimensioni chunk, tempi per chiamata, ecc.)",
+    )
 
     args = parser.parse_args(argv)
     if args.max_chars < 1000:
@@ -238,8 +292,13 @@ def parse_args(argv: Sequence[str]) -> Config:
         temperature=args.temperature,
         timeout=args.timeout,
         max_output_tokens=args.max_output_tokens,
+        verbose=args.verbose,
     )
 
+
+# ---------------------------------------------------------------------------
+# File reading
+# ---------------------------------------------------------------------------
 
 def read_input_file(input_path: Path) -> str:
     """Legge un file PDF o DOCX e ne estrae il testo grezzo in ordine sequenziale.
@@ -258,6 +317,8 @@ def read_input_file(input_path: Path) -> str:
         raise FileNotFoundError(f"File non trovato: {input_path}")
 
     suffix = input_path.suffix.lower()
+    log.info("Lettura file: %s  (formato: %s)", input_path.name, suffix.lstrip(".").upper())
+
     if suffix == ".pdf":
         text = extract_text_from_pdf(input_path)
     elif suffix == ".docx":
@@ -268,6 +329,8 @@ def read_input_file(input_path: Path) -> str:
     cleaned = normalize_text(text)
     if not cleaned.strip():
         raise ValueError("Nessun testo estraibile dal documento")
+
+    log.info("Testo estratto: %d caratteri", len(cleaned))
     return cleaned
 
 
@@ -281,10 +344,16 @@ def extract_text_from_pdf(input_path: Path) -> str:
         Una stringa contenente il testo estratto da tutte le pagine.
     """
     reader = PdfReader(str(input_path))
+    total_pages = len(reader.pages)
+    log.info("PDF: %d pagine trovate", total_pages)
+
     parts: List[str] = []
     for index, page in enumerate(reader.pages, start=1):
+        log.debug("  Estrazione pagina %d/%d ...", index, total_pages)
         page_text = page.extract_text(extraction_mode="layout") or page.extract_text() or ""
         parts.append(f"\n\n[PAGE {index}]\n{page_text}")
+
+    log.info("Estrazione PDF completata")
     return "".join(parts)
 
 
@@ -323,22 +392,32 @@ def extract_text_from_docx(input_path: Path) -> str:
     Returns:
         Testo del documento, incluse righe tabellari serializzate in formato leggibile.
     """
+    log.info("Apertura documento DOCX ...")
     document = Document(str(input_path))
     blocks: List[str] = []
+    n_paragraphs = 0
+    n_tables = 0
 
     for block in iter_block_items(document):
         if isinstance(block, Paragraph):
             text = block.text.strip()
             if text:
                 blocks.append(text)
+                n_paragraphs += 1
         elif isinstance(block, Table):
             for row in block.rows:
                 row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
                 if row_text:
                     blocks.append(f"[TABLE] {row_text}")
+            n_tables += 1
 
+    log.info("DOCX: %d paragrafi, %d tabelle estratti", n_paragraphs, n_tables)
     return "\n".join(blocks)
 
+
+# ---------------------------------------------------------------------------
+# Text processing
+# ---------------------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
     """Normalizza il testo estratto riducendo rumore tipografico comune.
@@ -368,6 +447,7 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
         Lista di chunk ordinati.
     """
     if len(text) <= max_chars:
+        log.info("Documento piccolo: 1 solo chunk (%d caratteri)", len(text))
         return [text]
 
     chunks: List[str] = []
@@ -386,8 +466,20 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
         if end >= len(text):
             break
         start = max(0, end - overlap)
+
+    log.info(
+        "Chunking: %d chunk generati  (max_chars=%d, overlap=%d)",
+        len(chunks), max_chars, overlap,
+    )
+    for i, c in enumerate(chunks, start=1):
+        log.debug("  Chunk %d: %d caratteri", i, len(c))
+
     return chunks
 
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 
 def build_headers(api_key: str) -> dict:
     """Costruisce gli header HTTP per una API OpenAI-compatible.
@@ -408,6 +500,7 @@ def call_chat_completion(
     config: Config,
     messages: List[dict],
     response_format: dict | None = None,
+    label: str = "LLM",
 ) -> str:
     """Effettua una chiamata al endpoint chat completions compatibile OpenAI.
 
@@ -415,6 +508,7 @@ def call_chat_completion(
         config: Configurazione runtime con URL, modello e timeout.
         messages: Messaggi chat da inviare al modello.
         response_format: Eventuale vincolo di formato risposta, se supportato.
+        label: Etichetta descrittiva mostrata nel log per identificare la chiamata.
 
     Returns:
         Il contenuto testuale della prima choice restituita dal provider.
@@ -432,21 +526,44 @@ def call_chat_completion(
         payload["response_format"] = response_format
 
     url = f"{config.base_url}/chat/completions"
+    log.debug("  → POST %s  [%s]", url, label)
+
+    t_start = time.monotonic()
     response = requests.post(
         url,
         headers=build_headers(config.api_key),
         json=payload,
         timeout=config.timeout,
     )
+    elapsed = time.monotonic() - t_start
+
     if response.status_code >= 400:
         raise RuntimeError(f"Errore HTTP {response.status_code}: {response.text}")
 
     data = response.json()
+    log.debug("  ← risposta ricevuta in %.1fs  [%s]", elapsed, label)
+
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Risposta inattesa dal provider: {json.dumps(data)[:1200]}") from exc
 
+    # Log utilizzo token se il provider lo restituisce
+    usage = data.get("usage")
+    if usage:
+        log.debug(
+            "  token: prompt=%s  completion=%s  total=%s",
+            usage.get("prompt_tokens", "?"),
+            usage.get("completion_tokens", "?"),
+            usage.get("total_tokens", "?"),
+        )
+
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Chunk extraction
+# ---------------------------------------------------------------------------
 
 def extract_chunk_structure(config: Config, chunk: str, chunk_index: int, total_chunks: int) -> ChunkResult:
     """Invia un chunk all'LLM e ne ricava una struttura JSON normalizzata.
@@ -463,6 +580,11 @@ def extract_chunk_structure(config: Config, chunk: str, chunk_index: int, total_
     Raises:
         RuntimeError: Se l'LLM non restituisce JSON valido.
     """
+    log.info(
+        "[%d/%d] Elaborazione chunk (%d caratteri) ...",
+        chunk_index, total_chunks, len(chunk),
+    )
+
     prompt = CHUNK_PROMPT_TEMPLATE.format(
         chunk_index=chunk_index,
         total_chunks=total_chunks,
@@ -470,6 +592,8 @@ def extract_chunk_structure(config: Config, chunk: str, chunk_index: int, total_
         source_type=config.input_path.suffix.lower().lstrip("."),
         chunk_text=chunk,
     )
+
+    t_start = time.monotonic()
     content = call_chat_completion(
         config,
         messages=[
@@ -477,11 +601,20 @@ def extract_chunk_structure(config: Config, chunk: str, chunk_index: int, total_
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
+        label=f"chunk {chunk_index}/{total_chunks}",
     )
+    elapsed = time.monotonic() - t_start
+
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"JSON non valido nel chunk {chunk_index}: {content[:1000]}") from exc
+
+    n_examples = len(payload.get("examples") or [])
+    log.info(
+        "[%d/%d] ✓ chunk completato in %.1fs  (esempi trovati: %d)",
+        chunk_index, total_chunks, elapsed, n_examples,
+    )
 
     return ChunkResult(
         title_candidates=payload.get("title_candidates", []) or [],
@@ -496,6 +629,10 @@ def extract_chunk_structure(config: Config, chunk: str, chunk_index: int, total_
         source_notes=payload.get("source_notes", []) or [],
     )
 
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
 
 def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
     """Rimuove duplicati preservando il primo ordinamento utile.
@@ -528,6 +665,8 @@ def aggregate_chunk_results(results: Sequence[ChunkResult]) -> dict:
     Returns:
         Dizionario serializzabile in JSON con materiale consolidato.
     """
+    log.info("Aggregazione risultati da %d chunk ...", len(results))
+
     aggregated_examples: List[dict] = []
     seen_examples = set()
 
@@ -544,7 +683,7 @@ def aggregate_chunk_results(results: Sequence[ChunkResult]) -> dict:
             seen_examples.add(key)
             aggregated_examples.append({"kind": kind, "content": content, "verbatim": verbatim})
 
-    return {
+    aggregated = {
         "title_candidates": dedupe_preserve_order(
             item for result in results for item in result.title_candidates
         ),
@@ -565,6 +704,18 @@ def aggregate_chunk_results(results: Sequence[ChunkResult]) -> dict:
         "source_notes": dedupe_preserve_order(item for result in results for item in result.source_notes),
     }
 
+    log.debug(
+        "  Aggregazione: %d istruzioni, %d vincoli, %d esempi",
+        len(aggregated["core_instructions"]),
+        len(aggregated["constraints"]),
+        len(aggregated["examples"]),
+    )
+    return aggregated
+
+
+# ---------------------------------------------------------------------------
+# Final skill rendering
+# ---------------------------------------------------------------------------
 
 def render_final_skill(config: Config, aggregated: dict) -> str:
     """Richiede all'LLM la skill finale in Markdown a partire dai dati aggregati.
@@ -576,20 +727,33 @@ def render_final_skill(config: Config, aggregated: dict) -> str:
     Returns:
         Skill finale in formato Markdown.
     """
+    log.info("Generazione skill finale (chiamata LLM di merge) ...")
+
     prompt = FINAL_PROMPT_TEMPLATE.format(
         filename=config.input_path.name,
         source_type=config.input_path.suffix.lower().lstrip("."),
         aggregated_json=json.dumps(aggregated, ensure_ascii=False, indent=2),
     )
-    return call_chat_completion(
+
+    t_start = time.monotonic()
+    result = call_chat_completion(
         config,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         response_format=None,
+        label="final merge",
     ).strip()
+    elapsed = time.monotonic() - t_start
 
+    log.info("Skill finale generata in %.1fs  (%d caratteri)", elapsed, len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
 def save_text(output_path: Path, content: str) -> None:
     """Salva testo UTF-8 su disco creando le directory mancanti.
@@ -600,7 +764,12 @@ def save_text(output_path: Path, content: str) -> None:
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content, encoding="utf-8")
+    log.info("File salvato: %s", output_path)
 
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 def generate_skill(config: Config) -> Path:
     """Esegue l'intera pipeline: estrazione, chunking, chiamate LLM e salvataggio finale.
@@ -611,20 +780,45 @@ def generate_skill(config: Config) -> Path:
     Returns:
         Percorso del file skill generato.
     """
-    source_text = read_input_file(config.input_path)
-    chunks = chunk_text(source_text, max_chars=config.max_chars, overlap=config.overlap)
+    t_pipeline_start = time.monotonic()
+    log.info("=== Skill Generator avviato ===")
+    log.info("Sorgente : %s", config.input_path)
+    log.info("Output   : %s", config.output_path)
+    log.info("Modello  : %s  @ %s", config.model, config.base_url)
+    log.info("Parametri: max_chars=%d  overlap=%d  temperature=%s", config.max_chars, config.overlap, config.temperature)
 
+    # --- Fase 1: estrazione testo ---
+    log.info("--- Fase 1/4: Estrazione testo ---")
+    source_text = read_input_file(config.input_path)
+
+    # --- Fase 2: chunking ---
+    log.info("--- Fase 2/4: Chunking ---")
+    chunks = chunk_text(source_text, max_chars=config.max_chars, overlap=config.overlap)
+    log.info("Totale chunk da elaborare: %d", len(chunks))
+
+    # --- Fase 3: chiamate LLM per chunk ---
+    log.info("--- Fase 3/4: Analisi chunk via LLM ---")
     results: List[ChunkResult] = []
     for index, chunk in enumerate(chunks, start=1):
         result = extract_chunk_structure(config, chunk, index, len(chunks))
         results.append(result)
-        time.sleep(0.2)
+        if index < len(chunks):
+            time.sleep(0.2)
 
+    # --- Fase 4: merge finale ---
+    log.info("--- Fase 4/4: Merge e generazione skill finale ---")
     aggregated = aggregate_chunk_results(results)
     final_skill = render_final_skill(config, aggregated)
     save_text(config.output_path, final_skill)
+
+    elapsed_total = time.monotonic() - t_pipeline_start
+    log.info("=== Pipeline completata in %.1fs ===", elapsed_total)
     return config.output_path
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Punto d'ingresso CLI del programma.
@@ -637,11 +831,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     try:
         config = parse_args(argv if argv is not None else sys.argv[1:])
+        # Inizializza il logger globale con il livello scelto dall'utente
+        global log
+        log = setup_logging(verbose=config.verbose)
         output_path = generate_skill(config)
-        print(f"Skill generata in: {output_path}")
+        print(f"\n✓ Skill generata in: {output_path}")
         return 0
     except Exception as exc:
-        print(f"Errore: {exc}", file=sys.stderr)
+        logging.getLogger("skill_generator").error("Errore fatale: %s", exc, exc_info=True)
         return 1
 
 
