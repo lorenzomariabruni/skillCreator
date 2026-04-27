@@ -141,13 +141,15 @@ Roo Code naming rules (CRITICAL — violations make the skill invisible):
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = f"""\
-You are a senior AI agent skill author.
-You transform technical documents into HIGH-QUALITY reusable skill files for coding agents
+You are an expert AI orchestrator and prompt engineer specialising in agentic skill authoring.
+You transform technical documents into HIGH-QUALITY, comprehensive skill files for coding agents
 (Roo Code, Claude Code, and similar).
 
 {SKILL_FORMAT_RULES}
 
 Core rules:
+- A SHORT description is insufficient for accurate tool calling. Every skill body MUST be
+  comprehensive enough that a routing agent can make an unambiguous decision.
 - Preserve source intent, procedures, rules, heuristics, glossary, and examples.
 - Reorganise for maximum agent usefulness; remove repetition, OCR noise, boilerplate.
 - Copy ALL code examples, commands, configs, schemas, regexes, JSON, YAML, XML, SQL
@@ -221,6 +223,9 @@ SUB_SKILL_CHUNK_PROMPT = """\
 Generate (or continue) a dedicated skill file for the topic below, using ONLY the
 content in the document chunk provided.
 
+A short description is NOT sufficient for accurate agentic routing. The skill body
+must be comprehensive enough that a routing agent can make an unambiguous decision.
+
 {skill_format_rules}
 
 Skill to generate:
@@ -233,12 +238,32 @@ Source: {filename}  (chunk {chunk_index}/{total_chunks})
 Instructions:
 1. Focus ONLY on the topic above; skip unrelated content.
 2. Include ALL code examples, commands, configs relevant to this topic VERBATIM.
-3. Structure:
-   ## Purpose
-   ## When to use
-   ## Core instructions
-   ## Examples      ← every relevant code block from the source, verbatim
+3. Structure the Markdown body with the following sections IN ORDER:
+   ## Core Purpose
+   A concise 1-2 sentence explanation of what this skill accomplishes.
+
+   ## When to Use
+   Explicit bullet-point rules defining the exact user intents, contexts, or data
+   requirements that mandate calling this skill.
+
+   ## When NOT to Use
+   Explicit bullet-point boundaries explaining when the agent should bypass this skill
+   (e.g., when internal knowledge suffices, or a different skill is more appropriate).
+
+   ## Example Triggers
+   3 to 5 distinct, realistic examples of user queries that should invoke this skill.
+   Format each as:
+   - "<user query>" -> Use this skill to <action>.
+
+   ## Core Instructions
+   Step-by-step procedures, rules, heuristics, and configuration details.
+
+   ## Examples
+   Every relevant code block from the source, verbatim.
+
    ## Constraints
+   Hard limits, caveats, known edge cases, and version requirements.
+
 4. If this is not chunk 1, output ONLY new sections/content not already covered;
    do not repeat the frontmatter or sections already written.
 5. Begin with the YAML frontmatter ONLY on chunk 1:
@@ -263,6 +288,9 @@ Chunk:
 SUB_SKILL_MERGE_PROMPT = """\
 Merge the partial skill outputs below into ONE complete, deduplicated skill file.
 
+A short description is NOT sufficient for accurate agentic routing. The merged output
+must be comprehensive enough that a routing agent can make an unambiguous decision.
+
 {skill_format_rules}
 
 Skill metadata:
@@ -276,19 +304,54 @@ Rules:
 - Output a single skill file starting with the YAML frontmatter (name + description only).
 - The very first line must be --- (opening frontmatter delimiter).
 - name must use hyphens only (NO underscores).
-- Deduplicate aggressively; keep the most complete/authoritative version.
+- Deduplicate aggressively; keep the most complete/authoritative version of each section.
 - Preserve ALL code blocks verbatim; never rewrite them.
-- Sections: ## Purpose / ## When to use / ## Core instructions / ## Examples / ## Constraints
+- The Markdown body MUST contain the following sections IN ORDER:
+  ## Core Purpose        — 1-2 sentence explanation of what the skill accomplishes.
+  ## When to Use         — explicit bullet-point trigger conditions.
+  ## When NOT to Use     — explicit bullet-point negative constraints.
+  ## Example Triggers    — 3 to 5 user query examples formatted as:
+                           - "<query>" -> Use this skill to <action>.
+  ## Core Instructions   — step-by-step procedures, rules, heuristics.
+  ## Examples            — all relevant code blocks from the source, verbatim.
+  ## Constraints         — hard limits, caveats, edge cases, version requirements.
 """
 
 # ---------------------------------------------------------------------------
 # Prompt: Phase C – generate main SKILL.md
 # ---------------------------------------------------------------------------
 
+MAIN_SKILL_SYSTEM_PROMPT = """\
+You are an expert AI orchestrator and prompt engineer. Your task is to expand a basic
+skill outline into a highly optimised tool description for an LLM agent. This description
+will be saved in SKILL.md and used by the model's router to decide when to call the tool.
+
+A short description is insufficient for accurate tool calling. You must generate a
+comprehensive description that leaves no ambiguity for the routing agent.
+"""
+
 MAIN_SKILL_PROMPT = """\
 Generate the MAIN (index) skill file SKILL.md for a document broken into sub-skills.
 
 {skill_format_rules}
+
+Based on the provided information, generate a SKILL.md description that includes the
+following sections:
+
+1. Core Purpose: A concise, 1-2 sentence explanation of what the tool accomplishes.
+2. When to Use (Trigger Conditions): Explicit bullet-point instructions defining the
+   exact user intents, contexts, or data requirements that mandate calling this tool.
+3. When NOT to Use (Negative Constraints): Explicit bullet-point boundaries explaining
+   when the model should bypass this tool (e.g., relying on internal knowledge or a
+   different tool instead).
+4. Example Triggers: Provide 3 to 5 distinct, realistic examples of user queries that
+   should result in calling this tool. Format each as:
+   - "<user query>" -> Use this skill to <action>.
+5. Sub-skills index: for each sub-skill list name, file path, and a one-sentence
+   "Load when:" description.
+6. Quick Reference: the most critical cross-cutting rules as a bullet list.
+
+Input Data:
 
 Document      : {filename}
 Main skill    : {main_skill_name}
@@ -297,22 +360,16 @@ Description   : {main_skill_description}
 Sub-skills already generated (saved under references/):
 {sub_skills_list}
 
-Instructions:
-1. Start with the YAML frontmatter (name + description only, no other fields):
-   ---
-   name: {main_skill_name}
-   description: {main_skill_description}
-   ---
-   (name must use hyphens only, NO underscores)
-2. Write a concise overview of what the document covers (3-6 bullets).
-3. ## Sub-skills section — for each sub-skill:
-   ### <name>
-   File: `references/<name>.md`
-   Load when: <one sentence describing the exact situation>
-4. ## Quick reference — the most critical cross-cutting rules as a bullet list.
-5. Do NOT duplicate content already in sub-skills; reference, do not repeat.
-6. Keep SKILL.md concise — it is a router/index, not a repeat of the sub-skills.
-7. The very first line of the output must be --- (the opening frontmatter delimiter).
+Additional instructions:
+- Start with the YAML frontmatter (name + description only, no other fields):
+  ---
+  name: {main_skill_name}
+  description: {main_skill_description}
+  ---
+  (name must use hyphens only, NO underscores)
+- The very first line of the output must be --- (the opening frontmatter delimiter).
+- Do NOT duplicate content already in sub-skills; reference, do not repeat.
+- Output only the formatted Markdown content for the SKILL.md file.
 
 Document excerpt (first 4000 chars):
 <excerpt>
@@ -788,10 +845,19 @@ def generate_main_skill(
     main_name: str,
 ) -> str:
     log.info("--- Fase C: Generazione SKILL.md principale ---")
-    main_desc = (
-        f"Master index for {config.input_path.name}. "
-        "Load to discover which sub-skill to use for a given task."
-    )
+
+    # Build a semantic description from the sub-skill descriptions rather than a
+    # generic placeholder, so the frontmatter field is a meaningful routing sentence.
+    if len(descriptors) == 1:
+        main_desc = descriptors[0].description
+    else:
+        topics = ", ".join(d.name.replace("-", " ") for d in descriptors[:4])
+        suffix = f" and {len(descriptors) - 4} more" if len(descriptors) > 4 else ""
+        main_desc = (
+            f"Load to route tasks related to {topics}{suffix} "
+            f"from {config.input_path.name}; see sub-skills for precise trigger conditions."
+        )
+
     sub_list = "\n".join(
         f"- name: {d.name}\n  file: references/{d.name}.md\n"
         f"  description: {d.description}\n  section_hint: {d.section_hint}"
@@ -808,7 +874,7 @@ def generate_main_skill(
     t0 = time.monotonic()
     content = _safe_strip(
         call_llm(config,
-                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                 messages=[{"role": "system", "content": MAIN_SKILL_SYSTEM_PROMPT},
                            {"role": "user", "content": prompt}],
                  label="main"),
         label="main",
