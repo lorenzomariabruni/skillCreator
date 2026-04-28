@@ -108,6 +108,92 @@ def _to_skill_name(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Roo Code output sanitiser
+# ---------------------------------------------------------------------------
+
+def sanitize_skill_output(raw: str, expected_name: str | None = None) -> str:
+    """Ensure the LLM output is a Roo Code-compatible skill file.
+
+    Fixes applied (in order):
+    1. Strip an outer fenced code block wrapper (```markdown ... ``` or ``` ... ```).
+    2. Remove any blank lines that appear before the opening ``---``.
+    3. Parse the YAML frontmatter and keep ONLY ``name`` and ``description``.
+       - Normalise ``name`` through ``_to_skill_name()``.
+       - If ``expected_name`` is provided and the parsed name differs, override it.
+    4. Reconstruct the frontmatter with exactly the two allowed fields.
+    5. Guarantee exactly ONE blank line between the closing ``---`` and the body.
+
+    Returns the sanitised content, or raises RuntimeError if no valid frontmatter
+    can be found after all attempts.
+    """
+    text = raw.strip()
+
+    # 1. Strip fenced code block wrapper
+    # Handles ```markdown, ```md, ``` (with optional trailing language tag)
+    fence_re = re.compile(r"^```[a-zA-Z]*\n(.*?)\n?```\s*$", re.DOTALL)
+    m = fence_re.match(text)
+    if m:
+        text = m.group(1).strip()
+
+    # 2. Remove blank lines before the very first ---
+    lines = text.splitlines()
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            start_idx = i
+            break
+    text = "\n".join(lines[start_idx:])
+
+    # 3 & 4. Parse frontmatter and rebuild with only name + description
+    fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*(\n|$)", re.DOTALL)
+    fm_match = fm_re.match(text)
+    if not fm_match:
+        raise RuntimeError(
+            "sanitize_skill_output: no valid YAML frontmatter found after sanitisation.\n"
+            f"Content start: {text[:300]!r}"
+        )
+
+    fm_body = fm_match.group(1)
+    body_after = text[fm_match.end():]
+
+    # Parse individual fields from the raw frontmatter (simple key: value parsing,
+    # handles multi-line description values that are indented).
+    fields: dict[str, str] = {}
+    current_key: str | None = None
+    for line in fm_body.splitlines():
+        kv = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)", line)
+        if kv:
+            current_key = kv.group(1)
+            fields[current_key] = kv.group(2).strip().strip('"').strip("'")
+        elif current_key and line.startswith((" ", "\t")):
+            # continuation of previous value
+            fields[current_key] = (fields[current_key] + " " + line.strip()).strip()
+
+    raw_name = fields.get("name", "")
+    description = fields.get("description", "")
+
+    # Normalise name
+    sanitised_name = _to_skill_name(raw_name) if raw_name else ""
+    if expected_name:
+        expected_clean = _to_skill_name(expected_name)
+        if sanitised_name != expected_clean:
+            log.debug(
+                "sanitize_skill_output: overriding name %r → %r", sanitised_name, expected_clean
+            )
+            sanitised_name = expected_clean
+
+    if not sanitised_name:
+        sanitised_name = "skill"
+    if not description:
+        description = f"Load when working with {sanitised_name}."
+
+    # 5. Reconstruct with exactly one blank line after closing ---
+    body_after = body_after.lstrip("\n")
+    sanitised = f"---\nname: {sanitised_name}\ndescription: {description}\n---\n\n{body_after}"
+    return sanitised
+
+
+# ---------------------------------------------------------------------------
 # Skill output format (injected into every generation prompt)
 # ---------------------------------------------------------------------------
 
@@ -760,13 +846,14 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
             chunk_text=chunks[0],
         )
         t0 = time.monotonic()
-        result = _safe_strip(
+        raw = _safe_strip(
             call_llm(config,
                      messages=[{"role": "system", "content": SYSTEM_PROMPT},
                                {"role": "user", "content": prompt}],
                      label=f"{descriptor.name}[1/1]"),
             label=f"{descriptor.name}[1/1]",
         )
+        result = sanitize_skill_output(raw, expected_name=descriptor.name)
         log.info("  ✓ %s  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(result))
         return result
 
@@ -796,6 +883,12 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
             raw = ""
 
         if raw and raw.strip().upper() != "NO_RELEVANT_CONTENT":
+            # Only sanitize chunk 1 (has frontmatter); subsequent chunks are raw body text
+            if i == 1:
+                try:
+                    raw = sanitize_skill_output(raw, expected_name=descriptor.name)
+                except RuntimeError as exc:
+                    log.warning("  Chunk 1 sanitize failed (%s), keeping raw output.", exc)
             partials.append(raw)
         else:
             log.debug("  Chunk %d/%d: no relevant content, skipped.", i, len(chunks))
@@ -810,6 +903,7 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
 
     if len(partials) == 1:
         log.info("  Solo 1 partial valido per %s.", descriptor.name)
+        # Already sanitized above (was chunk 1)
         return partials[0]
 
     log.info("  Merge %d parti per skill %s ...", len(partials), descriptor.name)
@@ -823,13 +917,14 @@ def generate_sub_skill(config: Config, descriptor: SubSkillDescriptor, document_
         partials=numbered,
     )
     t0 = time.monotonic()
-    merged = _safe_strip(
+    merged_raw = _safe_strip(
         call_llm(config,
                  messages=[{"role": "system", "content": SYSTEM_PROMPT},
                            {"role": "user", "content": merge_prompt}],
                  label=f"{descriptor.name}[merge]"),
         label=f"{descriptor.name}[merge]",
     )
+    merged = sanitize_skill_output(merged_raw, expected_name=descriptor.name)
     log.info("  ✓ %s merged  —  %.1fs  (%d chars)", descriptor.name, time.monotonic() - t0, len(merged))
     return merged
 
@@ -872,13 +967,14 @@ def generate_main_skill(
         document_excerpt=document_md[:4000],
     )
     t0 = time.monotonic()
-    content = _safe_strip(
+    raw = _safe_strip(
         call_llm(config,
                  messages=[{"role": "system", "content": MAIN_SKILL_SYSTEM_PROMPT},
                            {"role": "user", "content": prompt}],
                  label="main"),
         label="main",
     )
+    content = sanitize_skill_output(raw, expected_name=main_name)
     log.info("SKILL.md pronto  —  %.1fs  (%d chars)", time.monotonic() - t0, len(content))
     return content
 
@@ -891,7 +987,15 @@ def save_main_skill(skill_dir: Path, content: str) -> Path:
     """
     Save SKILL.md inside skill_dir.
     skill_dir must be named after the skill (e.g. ~/.roo/skills/<skill-name>/).
+    A final sanitization pass is applied before writing as a safety net.
     """
+    # Derive expected name from the directory name (last component)
+    expected_name = skill_dir.name
+    try:
+        content = sanitize_skill_output(content, expected_name=expected_name)
+    except RuntimeError as exc:
+        log.warning("save_main_skill: sanitize failed (%s), writing content as-is.", exc)
+
     skill_dir.mkdir(parents=True, exist_ok=True)
     path = skill_dir / MAIN_SKILL_FILENAME
     path.write_text(content, encoding="utf-8")
@@ -900,7 +1004,14 @@ def save_main_skill(skill_dir: Path, content: str) -> Path:
 
 
 def save_sub_skill(skill_dir: Path, name: str, content: str) -> Path:
-    """Save references/<name>.md inside the main skill directory."""
+    """Save references/<name>.md inside the main skill directory.
+    A final sanitization pass is applied before writing as a safety net.
+    """
+    try:
+        content = sanitize_skill_output(content, expected_name=name)
+    except RuntimeError as exc:
+        log.warning("save_sub_skill(%s): sanitize failed (%s), writing content as-is.", name, exc)
+
     ref_dir = skill_dir / REFERENCES_DIR
     ref_dir.mkdir(parents=True, exist_ok=True)
     path = ref_dir / f"{name}.md"
